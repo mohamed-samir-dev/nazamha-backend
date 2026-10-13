@@ -1,0 +1,36 @@
+# Seed files
+src/seed.ts
+src/seedTeacher.ts
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables — never commit secrets
+.env
+.env.*
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Package lock (optional: keep if you want reproducible installs)
+# package-lock.json
+
+# WhatsApp session
+.wwebjs_auth/
+.wwebjs_cache/

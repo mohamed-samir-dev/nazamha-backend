@@ -1,0 +1,525 @@
+import { prepareAttendance } from "../utils/prepareAttendance";
+import { Response } from "express";
+import mongoose from "mongoose";
+import { AttendanceRecord } from "../models/AttendanceRecord";
+import { Student } from "../models/Student";
+import { Group } from "../models/Group";
+import { AuthRequest, teacherFilter, canAccessTeacher } from "../middleware/auth";
+import { buildLocalDate } from "../utils/timezoneUtils";
+import { validateCrossGroupAttendance } from "../utils/attendanceScheduleValidator";
+
+/** تحويل teacher_id filter إلى ObjectId للاستخدام في aggregation $match */
+function toAggregationFilter(base: Record<string, unknown>): Record<string, unknown> {
+  if (!base.teacher_id) return base;
+  const tid = base.teacher_id;
+  const toOid = (id: string) => new mongoose.Types.ObjectId(id);
+  if (typeof tid === "string") return { ...base, teacher_id: toOid(tid) };
+  if (tid && typeof tid === "object" && "$in" in (tid as any)) {
+    return { ...base, teacher_id: { $in: ((tid as any).$in as string[]).map(toOid) } };
+  }
+  return base;
+}
+
+export const getAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { month, year, group_id, session_date, status } = req.query;
+  const base = teacherFilter(req);
+
+  if (group_id || session_date) {
+    const filter: Record<string, unknown> = { ...base };
+    if (group_id) filter.group_id = group_id;
+    if (session_date) filter.session_date = session_date;
+    if (status) filter.status = status;
+    if (req.query.student_id) filter.student_id = req.query.student_id;
+    const records = await AttendanceRecord.find(filter).lean() as any[];
+    const studentIds = [...new Set(records.map((r) => String(r.student_id)))];
+    const studentDocs = await Student.find({ _id: { $in: studentIds } }).lean().select("_id name") as any[];
+    const nameMap = new Map(studentDocs.map((s) => [String(s._id), s.name as string]));
+    const enriched = records.map((r) => ({ ...r, student_name: nameMap.get(String(r.student_id)) ?? null }));
+    res.json(enriched);
+    return;
+  }
+
+  const { limit } = req.query;
+  if (limit) {
+    const filter: Record<string, unknown> = { ...base };
+    if (status) filter.status = status;
+    const records = await AttendanceRecord.find(filter)
+      .sort({ session_date: -1 })
+      .limit(Number(limit));
+    res.json(records);
+    return;
+  }
+
+  const m = Number(month);
+  const y = Number(year);
+  if (isNaN(m) || isNaN(y)) {
+    res.status(400).json({ message: "month و year مطلوبان" });
+    return;
+  }
+  if (m < 1 || m > 12) {
+    res.status(400).json({ message: "month يجب أن يكون بين 1 و 12" }); return;
+  }
+  if (y < 2000 || y > 2100) {
+    res.status(400).json({ message: "year غير صالح" }); return;
+  }
+  const filter: Record<string, unknown> = { ...base, month: m, year: y };
+  if (req.query.student_id) filter.student_id = req.query.student_id;
+  const records = await AttendanceRecord.find(filter).lean();
+  res.json(records.map((r: any) => ({
+    ...r,
+    id: String(r._id),
+    student_id: String(r.student_id),
+    group_id: r.group_id ? String(r.group_id) : null,
+    teacher_id: r.teacher_id ? String(r.teacher_id) : undefined,
+    _id: undefined,
+    __v: undefined,
+  })));
+};
+
+/**
+ * التحقق من صلاحية تسجيل حضور طالب عبر المجموعات
+ * يُستخدم قبل عرض تأكيد الحضور في Frontend
+ */
+export const validateCrossGroupScan = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { student_id, scanner_group_id, requested_date } = req.body;
+
+  if (!student_id || !scanner_group_id) {
+    res.status(400).json({ message: "معلومات غير كافية للتحقق" });
+    return;
+  }
+
+  // Determine effective teacher ID
+  let teacherId: string;
+  if (req.user!.user_type === "staff" && req.user!.effective_teacher_id) {
+    teacherId = req.user!.effective_teacher_id;
+  } else if (req.user!.is_admin) {
+    teacherId = req.body.teacher_id || req.user!.id;
+    if (!canAccessTeacher(req, teacherId)) { res.status(403).json({ message: "غير مصرح" }); return; }
+  } else if (req.user!.user_type === "center" || req.user!.user_type === "staff") {
+    teacherId = req.body.teacher_id;
+    if (!req.user!.center_teacher_ids?.includes(teacherId)) {
+      res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور لهذا المدرس" });
+      return;
+    }
+  } else {
+    teacherId = req.user!.id;
+  }
+
+  // Check ownership: student must belong to this teacher
+  const student = await Student.findOne({ _id: student_id, teacher_id: teacherId })
+    .lean()
+    .select("_id name group_id grade_id is_suspended suspended_until suspension_reason") as any;
+
+  if (!student) {
+    res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور هذا الطالب" });
+    return;
+  }
+
+  // Check suspension
+  if (student.is_suspended) {
+    if (!student.suspended_until || new Date(student.suspended_until) >= new Date()) {
+      res.status(403).json({
+        message: "هذا الطالب محظور ولا يمكن تسجيل حضوره",
+        suspended: true,
+        suspended_until: student.suspended_until,
+        suspension_reason: student.suspension_reason,
+        name: student.name,
+      });
+      return;
+    }
+    // Auto-lift expired suspension
+    await Student.findByIdAndUpdate(student_id, {
+      is_suspended: false,
+      suspended_until: null,
+      suspension_reason: null,
+    });
+  }
+
+  // Load student's original group
+  let studentGroup: { id: string; name: string; day_of_week: string; start_date?: string | null; grade_id?: string } | null = null;
+  if (student.group_id) {
+    const grp = await Group.findOne({ _id: student.group_id, teacher_id: teacherId })
+      .lean()
+      .select("_id name day_of_week start_date grade_id") as any;
+    if (grp) {
+      studentGroup = {
+        id: grp._id.toString(),
+        name: grp.name,
+        day_of_week: grp.day_of_week,
+        start_date: grp.start_date || null,
+        grade_id: grp.grade_id?.toString(),
+      };
+    }
+  }
+
+  // Load scanner group for grade comparison
+  const scannerGroup = await Group.findOne({ _id: scanner_group_id, teacher_id: teacherId })
+    .lean()
+    .select("_id grade_id") as any;
+
+  if (!scannerGroup) {
+    res.status(404).json({ message: "المجموعة المفتوحة غير موجودة" });
+    return;
+  }
+
+  // Check if student's grade differs from scanner group's grade
+  const studentGradeId = student.grade_id?.toString();
+  const scannerGradeId = scannerGroup.grade_id?.toString();
+
+  if (studentGradeId && scannerGradeId && studentGradeId !== scannerGradeId) {
+    // Return 200 with deny decision instead of 403
+    res.status(200).json({
+      decision: "deny",
+      reason: "الطالب من صف مختلف عن المجموعة المفتوحة",
+      studentGroupId: studentGroup?.id || null,
+      studentGroupName: studentGroup?.name || "لا توجد مجموعة",
+      studentGroupSchedule: studentGroup?.day_of_week || "—",
+      nextScheduledDate: null,
+      scheduledDateIsToday: false,
+      scheduledDateIsFuture: false,
+      scheduledDateInCurrentWeek: false,
+      scheduledDateInNextWeek: false,
+    });
+    return;
+  }
+
+  // Validate cross-group attendance using schedule logic
+  const timezone = "Africa/Cairo"; // TODO: load from teacher settings if available
+  const validation = await validateCrossGroupAttendance(
+    studentGroup,
+    scanner_group_id,
+    requested_date || new Date().toISOString().slice(0, 10),
+    timezone
+  );
+
+  res.json(validation);
+};
+
+export const upsertAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
+  // For assistant: always use effective_teacher_id (ignore body teacher_id for security)
+  let teacherId: string;
+  if (req.user!.user_type === "staff" && req.user!.effective_teacher_id) {
+    teacherId = req.user!.effective_teacher_id;
+  } else if (req.user!.is_admin) {
+    teacherId = req.body.teacher_id || req.user!.id;
+    if (!canAccessTeacher(req, teacherId)) { res.status(403).json({ message: "غير مصرح" }); return; }
+  } else if (req.user!.user_type === "center" || req.user!.user_type === "staff") {
+    teacherId = req.body.teacher_id;
+    if (!req.user!.center_teacher_ids?.includes(teacherId)) {
+      res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور لهذا المدرس" }); return;
+    }
+  } else {
+    teacherId = req.user!.id;
+  }
+
+  // Check ownership: student must belong to this teacher
+  const student = await Student.findOne({ _id: req.body.student_id, teacher_id: teacherId })
+    .lean()
+    .select("_id group_id grade_id group_join_date created_at is_suspended suspended_until suspension_reason") as any;
+  if (!student) {
+    res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور هذا الطالب" }); return;
+  }
+
+  let record;
+  try { record = await prepareAttendance(teacherId, student, req.body); }
+  catch (error) { res.status(400).json({ message: (error as Error).message }); return; }
+
+  // Check suspension
+  if (student.is_suspended) {
+    if (!student.suspended_until || new Date(student.suspended_until) >= new Date()) {
+      res.status(403).json({ message: "هذا الطالب محظور ولا يمكن تسجيل حضوره", suspended: true, suspended_until: student.suspended_until, name: student.name });
+      return;
+    }
+    // Auto-lift expired suspension
+    await Student.findByIdAndUpdate(record.student_id, { is_suspended: false, suspended_until: null, suspension_reason: null });
+  }
+
+  try {
+    const result = await AttendanceRecord.findOneAndUpdate(
+      { student_id: record.student_id, session_date: record.session_date, teacher_id: teacherId, group_id: record.group_id },
+      { $set: record },
+      { upsert: true, new: true, runValidators: true }
+    );
+    res.status(201).json(result);
+  } catch (error: any) {
+    if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور للطالب في مجموعة أخرى بنفس التاريخ؛ تم الحفاظ على السجل السابق" }); return; }
+    throw error;
+  }
+};
+
+export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
+  // For assistant: always use effective_teacher_id (ignore body teacher_id for security)
+  let resolvedTeacherId: string;
+  if (req.user!.user_type === "staff" && req.user!.effective_teacher_id) {
+    resolvedTeacherId = req.user!.effective_teacher_id;
+  } else if (req.user!.is_admin) {
+    resolvedTeacherId = req.body.teacher_id || req.user!.id;
+    if (!canAccessTeacher(req, resolvedTeacherId)) { res.status(403).json({ message: "غير مصرح" }); return; }
+  } else if (req.user!.user_type === "center" || req.user!.user_type === "staff") {
+    resolvedTeacherId = req.body.teacher_id;
+    if (resolvedTeacherId && !req.user!.center_teacher_ids?.includes(resolvedTeacherId)) {
+      res.status(403).json({ message: "ليس لديك صلاحية لهذا المدرس" }); return;
+    }
+  } else {
+    resolvedTeacherId = req.user!.id;
+  }
+
+  if (!Array.isArray(req.body.records) || req.body.records.length === 0 || req.body.records.length > 1000) { res.status(400).json({ message: "أرسل من 1 إلى 1000 سجل" }); return; }
+  const records = req.body.records.map((r: Record<string, unknown>) => ({ ...r, teacher_id: resolvedTeacherId || req.user!.id })) as Array<{ student_id: string; session_date: string } & Record<string, unknown>>;
+
+  // Check ownership: all student_ids must belong to this teacher
+  const studentIds = records.map((r) => r.student_id);
+  const students = await Student.find({ _id: { $in: studentIds }, teacher_id: resolvedTeacherId || req.user!.id }).lean() as any[];
+  const ownedIds = new Set(students.map((s) => String(s._id)));
+  const unauthorizedIds = studentIds.filter((id) => !ownedIds.has(id));
+  if (unauthorizedIds.length > 0) {
+    res.status(403).json({ message: "بعض الطلاب ليسوا تابعين لك" }); return;
+  }
+
+  // Filter out suspended students
+  const suspendedIds = new Set(
+    students
+      .filter((s) => s.is_suspended && (!s.suspended_until || new Date(s.suspended_until) >= new Date()))
+      .map((s) => String(s._id))
+  );
+  const allowedRecords = records.filter((r) => !suspendedIds.has(r.student_id));
+  const suspendedNames = students.filter((s) => suspendedIds.has(String(s._id))).map((s) => s.name);
+
+  let prepared;
+  try {
+    const studentMap = new Map(students.map(s => [String(s._id), s]));
+    prepared = await Promise.all(allowedRecords.map(r => prepareAttendance(resolvedTeacherId || req.user!.id, studentMap.get(r.student_id), r)));
+  } catch (error) { res.status(400).json({ message: (error as Error).message }); return; }
+  const ops = prepared.map((r) => ({
+    updateOne: {
+      filter: { student_id: r.student_id, session_date: r.session_date, teacher_id: r.teacher_id, group_id: r.group_id } as Record<string, unknown>,
+      update: { $set: r as Record<string, unknown> },
+      upsert: true,
+    },
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  })) as any[];
+  try {
+    if (ops.length > 0) await mongoose.connection.transaction(async session => {
+      await AttendanceRecord.bulkWrite(ops, { session });
+    });
+  } catch (error: any) {
+    if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور سابق في مجموعة أخرى؛ لم يتم تغيير أي سجل" }); return; }
+    throw error;
+  }
+  res.status(201).json({ message: "تم الحفظ بنجاح", suspended_skipped: suspendedNames });
+};
+
+export const getStudentAttendanceSummary = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { studentId } = req.params;
+  const { Student: S } = await import("../models/Student");
+  const student = await S.findOne({ _id: studentId, ...teacherFilter(req) }).lean() as any;
+  if (!student) { res.status(403).json({ message: "ليس لديك صلاحية لعرض بيانات هذا الطالب" }); return; }
+
+
+
+  const records = await AttendanceRecord.find({
+    student_id: studentId,
+    ...teacherFilter(req),
+  }).lean().select("status month year session_date") as any[];
+
+
+
+  const map = new Map<string, { present: number; absent: number; month: number; year: number }>();
+  for (const r of records) {
+    const key = `${r.year}-${r.month}`;
+    const cur = map.get(key) ?? { present: 0, absent: 0, month: r.month, year: r.year };
+    if (r.status === "present") cur.present++; else cur.absent++;
+    map.set(key, cur);
+  }
+  const summary = Array.from(map.values()).sort((a, b) =>
+    a.year !== b.year ? a.year - b.year : a.month - b.month
+  );
+  res.json(summary);
+};
+
+export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<void> => {
+  const matchBase = toAggregationFilter(teacherFilter(req));
+  const pipeline = [
+    { $match: matchBase },
+    { $group: { _id: { student_id: "$student_id", status: "$status" }, count: { $sum: 1 } } },
+    { $group: {
+      _id: "$_id.student_id",
+      present: { $sum: { $cond: [{ $eq: ["$_id.status", "present"] }, "$count", 0] } },
+      absent:  { $sum: { $cond: [{ $eq: ["$_id.status", "absent"]  }, "$count", 0] } },
+    }},
+  ];
+  const results = await AttendanceRecord.aggregate(pipeline);
+  const stats: Record<string, { present: number; absent: number }> = {};
+  for (const r of results) stats[String(r._id)] = { present: r.present, absent: r.absent };
+  res.json(stats);
+};
+
+// آخر حصة لكل مجموعة + الغائبون — aggregation واحدة بدل جلب كل السجلات
+export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): Promise<void> => {
+  const base = teacherFilter(req);
+  const matchBase = toAggregationFilter(base);
+
+  // خطوة 1: آخر session_date لكل group_id
+  const lastSessionPipeline = [
+    { $match: matchBase },
+    { $group: { _id: "$group_id", lastDate: { $max: "$session_date" } } },
+  ];
+  const lastSessions = await AttendanceRecord.aggregate(lastSessionPipeline) as { _id: string; lastDate: string }[];
+  if (lastSessions.length === 0) { res.json({}); return; }
+
+  // خطوة 2: من كان حاضراً في آخر حصة لكل مجموعة
+  const orConditions = lastSessions.map((s) => ({ group_id: s._id, session_date: s.lastDate, status: "present" }));
+  const presentRecords = await AttendanceRecord.find({ $or: orConditions, ...base })
+    .lean()
+    .select("student_id group_id session_date") as any[];
+
+  const presentMap = new Map<string, Set<string>>();
+  for (const r of presentRecords) {
+    const key = String(r.group_id);
+    if (!presentMap.has(key)) presentMap.set(key, new Set());
+    presentMap.get(key)!.add(String(r.student_id));
+  }
+
+  // خطوة 3: الطلاب لكل مجموعة
+  const groupIds = lastSessions.map((s) => s._id).filter(Boolean);
+  const students = await Student.find({ group_id: { $in: groupIds }, ...base })
+    .lean()
+    .select("_id name code group_id group_join_date") as any[];
+
+  const result: Record<string, { sessionDate: string; absentees: { id: string; name: string; code: string | null }[] }> = {};
+  for (const { _id: groupId, lastDate } of lastSessions) {
+    if (!groupId) continue;
+    const key = String(groupId);
+    const presentIds = presentMap.get(key) ?? new Set();
+    const absentees = students
+      .filter((s: any) => {
+        if (String(s.group_id) !== key) return false;
+        const joinDate = s.group_join_date ?? null;
+        if (joinDate && joinDate > lastDate) return false;
+        return !presentIds.has(String(s._id));
+      })
+      .map((s: any) => ({ id: String(s._id), name: s.name, code: s.code ?? null }));
+    result[key] = { sessionDate: lastDate, absentees };
+  }
+
+  res.json(result);
+};
+
+export const deleteAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
+  await AttendanceRecord.findOneAndDelete({ _id: req.params.id, ...teacherFilter(req) });
+  res.json({ message: "تم الحذف بنجاح" });
+};
+
+// تسجيل غياب تلقائي لكل طالب لم يُسجَّل حضوره بعد مرور ساعة على وقت الحصة
+export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<void> => {
+  const { group_id, session_date } = req.body as { group_id: string; session_date: string };
+  if (!group_id || !session_date) {
+    res.status(400).json({ message: "group_id و session_date مطلوبان" });
+    return;
+  }
+
+  // Resolve effective teacher ID (supports assistant)
+  const effectiveTeacherId = req.user!.effective_teacher_id ?? req.user!.id;
+
+  const group = await Group.findOne({ _id: group_id, teacher_id: effectiveTeacherId }).lean() as any;
+  if (!group) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
+
+  // تحقق أن ساعة مرت على وقت الحصة (بـ timezone المدرس)
+  const teacherTz = (group as any).teacher_timezone || "Africa/Cairo";
+  const sessionTime = buildLocalDate(session_date, group.time as string, teacherTz);
+  sessionTime.setTime(sessionTime.getTime() + 60 * 60 * 1000); // +1 hour
+  if (new Date() < sessionTime) {
+    res.status(400).json({ message: "لم تمر ساعة على وقت الحصة بعد" });
+    return;
+  }
+
+  const students = await Student.find({ group_id, teacher_id: effectiveTeacherId, is_suspended: { $ne: true } }).lean() as any[];
+  const existing = await AttendanceRecord.find({ group_id, session_date }).lean() as any[];
+  const existingIds = new Set(existing.map((r: any) => String(r.student_id)));
+
+  const toInsert = students
+    .filter((s: any) => !existingIds.has(String(s._id)))
+    .filter((s: any) => {
+      const joinDate = s.group_join_date || new Date(s.created_at).toISOString().slice(0, 10);
+      return joinDate <= session_date;
+    })
+    .map((s: any) => ({
+      student_id: s._id,
+      group_id,
+      teacher_id: effectiveTeacherId,
+      session_date,
+      month: parseInt(session_date.split("-")[1], 10),
+      year: parseInt(session_date.split("-")[0], 10),
+      status: "absent",
+    }));
+
+  if (toInsert.length > 0) {
+    await AttendanceRecord.insertMany(toInsert, { ordered: false });
+  }
+
+  res.json({ marked: toInsert.length });
+};
+
+// Batch auto-absent: مجموعة حصص في request واحد
+export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Promise<void> => {
+  const sessions = req.body.sessions as { group_id: string; session_date: string }[];
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    res.status(400).json({ message: "sessions مطلوبة" });
+    return;
+  }
+
+  const now = new Date();
+  const groupIds = [...new Set(sessions.map((s) => s.group_id))];
+  const effectiveTeacherId = req.user!.effective_teacher_id ?? req.user!.id;
+  const groups = await Group.find({ _id: { $in: groupIds }, teacher_id: effectiveTeacherId }).lean() as any[];
+  const groupMap = new Map(groups.map((g) => [String(g._id), g]));
+
+  const validSessions = sessions.filter(({ group_id, session_date }) => {
+    const group = groupMap.get(group_id);
+    if (!group) return false;
+    const teacherTz = (group as any).teacher_timezone || "Africa/Cairo";
+    const threshold = buildLocalDate(session_date, group.time as string, teacherTz);
+    threshold.setTime(threshold.getTime() + 60 * 60 * 1000);
+    return now >= threshold;
+  });
+
+  if (validSessions.length === 0) { res.json({ marked: 0 }); return; }
+
+  // جلب كل الطلاب والسجلات بقواريين
+  const [allStudents, existingRecords] = await Promise.all([
+    Student.find({ group_id: { $in: groupIds }, teacher_id: effectiveTeacherId, is_suspended: { $ne: true } }).lean() as any,
+    AttendanceRecord.find({
+      group_id: { $in: groupIds },
+      session_date: { $in: [...new Set(validSessions.map((s) => s.session_date))] },
+    }).lean().select("student_id group_id session_date"),
+  ]);
+
+  const existingSet = new Set(existingRecords.map((r: any) => `${String(r.student_id)}|${r.session_date}`));
+  const studentsByGroup = new Map<string, any[]>();
+  for (const s of allStudents) {
+    const key = String(s.group_id);
+    if (!studentsByGroup.has(key)) studentsByGroup.set(key, []);
+    studentsByGroup.get(key)!.push(s);
+  }
+
+  const toInsert: object[] = [];
+  for (const { group_id, session_date } of validSessions) {
+    const groupStudents = studentsByGroup.get(group_id) ?? [];
+    for (const s of groupStudents) {
+      const key = `${String(s._id)}|${session_date}`;
+      const joinDate = s.group_join_date || new Date(s.created_at).toISOString().slice(0, 10);
+      if (!existingSet.has(key) && joinDate <= session_date) {
+        toInsert.push({
+          student_id: s._id, group_id, teacher_id: effectiveTeacherId,
+          session_date,
+          month: parseInt(session_date.split("-")[1], 10),
+          year: parseInt(session_date.split("-")[0], 10),
+          status: "absent",
+        });
+      }
+    }
+  }
+
+  if (toInsert.length > 0) await AttendanceRecord.insertMany(toInsert, { ordered: false });
+  res.json({ marked: toInsert.length });
+};
