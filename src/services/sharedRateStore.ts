@@ -14,6 +14,8 @@ export function sharedRateStore(namespace: string): Store | undefined {
   };
   return {
     localKeys: false,
+    // Match the actual Redis namespace so layered limiters are distinguished.
+    prefix: `rate:${namespace}:`,
     init(options: Options) { windowMs = options.windowMs; },
     async increment(key: string) {
       const result = await (await client()).eval(

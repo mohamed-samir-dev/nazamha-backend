@@ -1,4 +1,5 @@
 import { withJobLease } from "../services/jobLease";
+import { schedulePeriodicTask } from "../services/periodicTask";
 import { eligibleForSession } from "../utils/sessionEligibility";
 import { buildLocalDate, getTodayInTimezone, getDayOfWeekInTimezone } from "../utils/timezoneUtils";
 export function scheduleAutoAbsent() {
@@ -104,9 +105,10 @@ export function scheduleAutoAbsent() {
     }
   };
 
-  const run = () => withJobLease("auto-absent", execute).catch(error => console.error("[auto-absent]", error.message));
-  void run();
-  const timer = setInterval(run, 60_000);
-  return () => clearInterval(timer);
+  return schedulePeriodicTask(
+    () => withJobLease("auto-absent", execute),
+    60_000,
+    error => console.error("[auto-absent]", error),
+  );
 }
 

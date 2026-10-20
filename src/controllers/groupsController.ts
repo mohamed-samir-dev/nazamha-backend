@@ -1,6 +1,7 @@
 import { atomicController, series } from "../services/atomicController";
 import { StudentMembership } from "../models/StudentMembership";
 import { validateOwnedReferences } from "../utils/ownedReferences";
+import { groupValidationError, validCalendarDate } from "../utils/groupValidation";
 import crypto from "crypto";
 import { Request, Response } from "express";
 import { Group } from "../models/Group";
@@ -165,6 +166,8 @@ export const getGroupsBySubTeacher = async (req: AuthRequest, res: Response): Pr
 
 export const addGroup = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const validation = groupValidationError(req.body);
+    if (validation) { res.status(400).json({ message: validation }); return; }
     const { name, day_of_week, time, monthly_price } = req.body;
     if (!name?.trim()) { res.status(400).json({ message: "اسم المجموعة مطلوب" }); return; }
     if (!day_of_week?.trim()) { res.status(400).json({ message: "يوم المجموعة مطلوب" }); return; }
@@ -210,7 +213,7 @@ export const addGroup = async (req: AuthRequest, res: Response): Promise<void> =
       teacher_id: teacherId,
     };
 
-    if (code !== undefined) groupData.code = code ? String(code).trim() : undefined;
+    if (code !== undefined) groupData.code = code ? String(code).trim().toUpperCase() : undefined;
     if (is_private !== undefined) groupData.is_private = Boolean(is_private);
     if (grade_id !== undefined) groupData.grade_id = grade_id || null;
     if (sub_teacher_id !== undefined) groupData.sub_teacher_id = sub_teacher_id || null;
@@ -220,20 +223,22 @@ export const addGroup = async (req: AuthRequest, res: Response): Promise<void> =
     if (!await validateOwnedReferences(teacherId, groupData)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
     const group = await Group.create(groupData);
     res.status(201).json(group);
-  } catch {
-    res.status(500).json({ message: "حدث خطأ أثناء إنشاء المجموعة" });
+  } catch (error: any) {
+    res.status(error?.code === 11000 ? 409 : 500).json({ message: error?.code === 11000 ? "كود المجموعة مستخدم بالفعل" : "حدث خطأ أثناء إنشاء المجموعة" });
   }
 };
 
-export const addGroupsBulk = async (req: AuthRequest, res: Response): Promise<void> => {
+export const addGroupsBulk = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const groups = req.body;
     if (!Array.isArray(groups) || groups.length === 0) {
       res.status(400).json({ message: "يجب إرسال مصفوفة من المجموعات" }); return;
     }
+    const validation = groups.map(g => g && typeof g === "object" ? groupValidationError(g) : "بيانات المجموعة غير صحيحة").find(Boolean);
+    if (validation) { res.status(400).json({ message: validation }); return; }
     const docs = groups.map((g) => ({
       name: String(g.name || "").trim(),
-      code: g.code ? String(g.code).trim() : undefined,
+      code: g.code ? String(g.code).trim().toUpperCase() : undefined,
       day_of_week: String(g.day_of_week || "").trim(),
       time: String(g.time || "").trim(),
       is_private: Boolean(g.is_private),
@@ -244,17 +249,14 @@ export const addGroupsBulk = async (req: AuthRequest, res: Response): Promise<vo
       start_date: g.start_date || null,
       teacher_id: req.user!.id,
     }));
-    if (!(await Promise.all(docs.map(doc => validateOwnedReferences(String(doc.teacher_id), doc)))).every(Boolean)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
+    for (const doc of docs) if (!await validateOwnedReferences(String(doc.teacher_id), doc)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
     const inserted = await Group.insertMany(docs, { ordered: true });
     res.status(201).json(inserted);
   } catch (err: any) {
-    if (err?.name === "MongoBulkWriteError" && err?.insertedDocs?.length) {
-      res.status(207).json({ inserted: err.insertedDocs, message: "تم إدراج بعض المجموعات فقط بسبب خطأ في الاتصال" });
-    } else {
-      res.status(503).json({ message: "تعذر الاتصال بقاعدة البيانات، يرجى المحاولة مرة أخرى" });
-    }
+    if (err?.hasErrorLabel?.("TransientTransactionError")) throw err;
+    res.status(err?.code === 11000 ? 409 : 503).json({ message: err?.code === 11000 ? "كود المجموعة مستخدم بالفعل؛ لم يتم إضافة أي مجموعة" : "تعذر إضافة المجموعات؛ لم يتم حفظ أي تغييرات" });
   }
-};
+});
 
 export const deleteGroupsBulk = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -275,7 +277,7 @@ export const deleteGroupsBulk = atomicController(async (req: AuthRequest, res: R
       Group.deleteMany({ _id: { $in: ids }, ...teacherFilter(req) }),
       Student.updateMany({ _id: { $in: studentIds } }, { $set: { group_id: null, group_join_date: null } }),
       studentIds.length
-        ? MonthlySubscription.deleteMany({ student_id: { $in: studentIds }, status: { $in: ["due", "not_due"] } })
+          ? MonthlySubscription.deleteMany({ student_id: { $in: studentIds }, ...teacherFilter(req), status: "not_due" })
         : Promise.resolve(),
       AttendanceRecord.deleteMany({ group_id: { $in: ids }, ...teacherFilter(req) }),
     ]);
@@ -286,14 +288,37 @@ export const deleteGroupsBulk = atomicController(async (req: AuthRequest, res: R
   }
 });
 
+async function repriceGroupSubscriptions(groupIds: string[], scope: Record<string, any>, newPrice: number): Promise<void> {
+      const { MonthlySubscription } = await import("../models/MonthlySubscription");
+      const students = await Student.find(
+        { ...scope, group_id: { $in: groupIds }, custom_monthly_price: { $in: [null, false, 0] } },
+        { _id: 1, family_discount_percent: 1, discount_value: 1 }
+      ).lean();
+      const ops = students.map((student) => {
+        const pct = (student.family_discount_percent ?? 0) > 0
+          ? student.family_discount_percent!
+          : (Number(student.discount_value) || 0);
+        const net = pct > 0 ? Math.round(newPrice * (1 - pct / 100)) : newPrice;
+        return {
+          updateMany: {
+            filter: { student_id: student._id, ...scope, status: { $in: ["due", "not_due"] } },
+            update: { amount: newPrice, discount: newPrice - net },
+          },
+        };
+      });
+      if (ops.length) await MonthlySubscription.bulkWrite(ops);
+}
+
 export const updateGroup = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const validation = groupValidationError(req.body, true);
+    if (validation) { res.status(400).json({ message: validation }); return; }
     const priceChanged = req.body.monthly_price !== undefined && req.body.monthly_price !== null;
 
     // Whitelist allowed fields for update
     const allowedUpdate: Record<string, any> = {};
     if (req.body.name !== undefined) allowedUpdate.name = String(req.body.name).trim();
-    if (req.body.code !== undefined) allowedUpdate.code = req.body.code ? String(req.body.code).trim() : null;
+    if (req.body.code !== undefined) allowedUpdate.code = req.body.code ? String(req.body.code).trim().toUpperCase() : null;
     if (req.body.day_of_week !== undefined) allowedUpdate.day_of_week = String(req.body.day_of_week).trim();
     if (req.body.time !== undefined) allowedUpdate.time = String(req.body.time).trim();
     if (req.body.is_private !== undefined) allowedUpdate.is_private = Boolean(req.body.is_private);
@@ -335,25 +360,7 @@ export const updateGroup = atomicController(async (req: AuthRequest, res: Respon
       if (ops.length) await Student.bulkWrite(ops);
     }
     if (priceChanged && Number(req.body.monthly_price) !== Number(oldPrice)) {
-      const { MonthlySubscription } = await import("../models/MonthlySubscription");
-      const students = await Student.find(
-        { ...teacherFilter(req), group_id: req.params.id, custom_monthly_price: { $in: [null, false, 0] } },
-        { _id: 1, family_discount_percent: 1, discount_value: 1 }
-      ).lean();
-      const newPrice = Number(req.body.monthly_price);
-      const ops = students.map((student) => {
-        const pct = (student.family_discount_percent ?? 0) > 0
-          ? student.family_discount_percent!
-          : (Number(student.discount_value) || 0);
-        const net = pct > 0 ? Math.round(newPrice * (1 - pct / 100)) : newPrice;
-        return {
-          updateMany: {
-            filter: { student_id: student._id, ...teacherFilter(req), status: "due" },
-            update: { amount: newPrice, discount: newPrice - net },
-          },
-        };
-      });
-      if (ops.length) await MonthlySubscription.bulkWrite(ops);
+      await repriceGroupSubscriptions([req.params.id], teacherFilter(req), Number(req.body.monthly_price));
     }
     res.json(group);
   } catch (error: any) {
@@ -362,12 +369,14 @@ export const updateGroup = atomicController(async (req: AuthRequest, res: Respon
   }
 });
 
-export const toggleCancelSession = async (req: AuthRequest, res: Response): Promise<void> => {
+export const toggleCancelSession = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { date } = req.body;
-    if (!date) { res.status(400).json({ message: "التاريخ مطلوب" }); return; }
+    if (!validCalendarDate(date)) { res.status(400).json({ message: "التاريخ غير صحيح" }); return; }
     const group = await Group.findOne({ _id: req.params.id, ...teacherFilter(req) });
     if (!group) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
+
+
     const cancelled = group.cancelled_sessions ?? [];
     const updated = cancelled.includes(date)
       ? cancelled.filter((d: string) => d !== date)
@@ -375,13 +384,16 @@ export const toggleCancelSession = async (req: AuthRequest, res: Response): Prom
     group.cancelled_sessions = updated;
     await group.save();
     res.json(group);
-  } catch {
+  } catch (error: any) {
+    if (error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء تعديل الجلسة" });
   }
-};
+});
 
-export const updateGroupsByGrade = async (req: AuthRequest, res: Response): Promise<void> => {
+export const updateGroupsByGrade = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
+    const validation = groupValidationError(req.body, true);
+    if (validation) { res.status(400).json({ message: validation }); return; }
     // Whitelist: فقط الحقول المسموح بتعديلها بالجملة
     const allowed: Record<string, unknown> = {};
     if (req.body.sessions_per_month !== undefined) allowed.sessions_per_month = Number(req.body.sessions_per_month);
@@ -391,16 +403,22 @@ export const updateGroupsByGrade = async (req: AuthRequest, res: Response): Prom
       res.status(400).json({ message: "لا توجد حقول صالحة للتحديث" }); return;
     }
     const targets = await Group.find({ grade_id: req.params.gradeId, ...teacherFilter(req) }).select("teacher_id").lean();
-    if (!(await Promise.all(targets.map(g => validateOwnedReferences(String(g.teacher_id), allowed)))).every(Boolean)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
+    for (const target of targets) {
+      if (!await validateOwnedReferences(String(target.teacher_id), allowed)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
+    }
     await Group.updateMany(
       { grade_id: req.params.gradeId, ...teacherFilter(req) },
       { $set: allowed }
     );
+    if (allowed.monthly_price !== undefined) {
+      await repriceGroupSubscriptions(targets.map(group => String(group._id)), teacherFilter(req), Number(allowed.monthly_price));
+    }
     res.json({ message: "تم التحديث بنجاح" });
-  } catch {
+  } catch (error: any) {
+    if (error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء التحديث" });
   }
-};
+});
 
 export const deleteGroup = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -409,6 +427,32 @@ export const deleteGroup = atomicController(async (req: AuthRequest, res: Respon
 
     const group = await Group.findOne({ _id: req.params.id, ...teacherFilter(req) });
     if (!group) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
+
+      if (req.body?.deleteStudents === true) {
+        if (req.user?.staff_permissions !== undefined && !req.user.staff_permissions.includes("students")) {
+          res.status(403).json({ message: "ليس لديك صلاحية حذف الطلاب" }); return;
+        }
+        const members = await Student.find({ group_id: group._id, ...teacherFilter(req) }).select("_id center_student_id").lean();
+        const ids = members.map(student => student._id);
+        const { ExamGrade } = await import("../models/Exam");
+        const { BookSale } = await import("../models/BookSale");
+        const history = await series([
+          AttendanceRecord.exists({ group_id: group._id, ...teacherFilter(req) }),
+          StudentMembership.exists({ group_id: group._id, student_id: { $nin: ids }, ...teacherFilter(req) }),
+          MonthlySubscription.exists({ student_id: { $in: ids }, status: { $in: ["paid", "exempt"] } }),
+          AttendanceRecord.exists({ student_id: { $in: ids } }),
+          ExamGrade.exists({ student_id: { $in: ids } }),
+          BookSale.exists({ student_id: { $in: ids } }),
+        ]);
+        if (history.some(Boolean)) {
+          res.status(409).json({ message: "المجموعة أو طلابها مرتبطون بسجل تاريخي؛ لم يتم حذف أي بيانات" }); return;
+        }
+        const { deleteStudentCascade } = await import("./students.crud.controller");
+        await Student.deleteMany({ _id: { $in: ids }, ...teacherFilter(req) });
+        for (const student of members) await deleteStudentCascade(String(student._id), student.center_student_id ? String(student.center_student_id) : null);
+        await group.deleteOne();
+        res.json({ message: "تم حذف المجموعة وطلابها بنجاح" }); return;
+      }
 
     if (await AttendanceRecord.exists({ group_id: req.params.id, ...teacherFilter(req) })) { res.status(409).json({ message: "لا يمكن حذف مجموعة لها سجل حضور" }); return; }
     const studentIds = await Student.find(
@@ -420,9 +464,9 @@ export const deleteGroup = atomicController(async (req: AuthRequest, res: Respon
     await series([
       group.deleteOne(),
       Student.updateMany({ _id: { $in: studentIds } }, { $set: { group_id: null, group_join_date: null } }),
-      // حذف الاشتراكات غير المدفوعة فقط — الحفاظ على السجلات المالية التاريخية
+      // Preserve outstanding debt; only future subscriptions are cancelled.
       studentIds.length
-        ? MonthlySubscription.deleteMany({ student_id: { $in: studentIds }, status: { $in: ["due", "not_due"] } })
+        ? MonthlySubscription.deleteMany({ student_id: { $in: studentIds }, ...teacherFilter(req), status: "not_due" })
         : Promise.resolve(),
       AttendanceRecord.deleteMany({ group_id: req.params.id }),
     ]);

@@ -1,14 +1,20 @@
 import Redis from "ioredis";
 
 // ── Redis connection ──────────────────────────────────────────────────────────
-// Redis is optional. When REDIS_URL is not set or the connection fails, all
-// callers fall back gracefully to MongoDB / in-memory paths.
-// We never throw — Redis unavailability is a degraded-mode scenario, not fatal.
+// Redis is optional. Individual consumers decide whether absence permits a
+// fallback; shared rate limiting intentionally fails closed when configured.
 
 let client: Redis | null = null;
 let connectionAttempted = false;
+let pendingConnection: Promise<Redis | null> | null = null;
 
 export async function getRedisClient(): Promise<Redis | null> {
+  if (connectionAttempted) return client;
+  if (!pendingConnection) pendingConnection = connectClient().finally(() => { pendingConnection = null; });
+  return pendingConnection;
+}
+
+async function connectClient(): Promise<Redis | null> {
   if (connectionAttempted) return client;
 
   const url = process.env.REDIS_URL;
@@ -28,10 +34,6 @@ export async function getRedisClient(): Promise<Redis | null> {
       enableOfflineQueue: false,
     });
 
-    await redis.connect();
-    client = redis;
-    console.log("[redis] Connected");
-
     redis.on("error", (err) => {
       // Log once per error burst, don't crash the process
       console.warn("[redis] Connection error:", err.message);
@@ -42,12 +44,15 @@ export async function getRedisClient(): Promise<Redis | null> {
       console.log("[redis] Reconnecting…");
     });
 
-    redis.on("connect", () => {
+    redis.on("ready", () => {
       client = redis;
-      console.log("[redis] Reconnected");
+      console.log("[redis] Ready");
     });
+    redis.on("close", () => { client = null; });
+    await redis.connect();
+    client = redis;
   } catch (err: any) {
-    console.warn("[redis] Could not connect:", err.message, "— falling back to in-memory/MongoDB");
+    console.warn("[redis] Could not connect:", err.message);
     client = null;
   }
 

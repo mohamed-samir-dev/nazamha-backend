@@ -1,3 +1,7 @@
+import { findScannedStudent } from "../utils/studentScan";
+import { SubscriptionPayment } from "../models/SubscriptionPayment";
+import { createHash } from "crypto";
+import { atomicController, series } from "../services/atomicController";
 import { generateSubscriptionsForStudent, syncAllStudentsForTeacher } from "../services/subscriptionLifecycle";
 export { generateSubscriptionsForStudent, syncNewMonthForAllStudents, syncAllStudentsForTeacher } from "../services/subscriptionLifecycle";
 import { Response } from "express";
@@ -13,22 +17,6 @@ function subTeacherFilter(req: AuthRequest): Record<string, unknown> {
   return teacherFilter(req);
 }
 
-// Given a list of {month, year} pairs and a start date, return only months >= start
-
-
-// Legacy: Given a sorted list of active months and a start (month, year),
-// assign each active month the correct calendar year — only months >= start.
-
-
-// Helper: resolve monthly price for a student (after family discount)
-
-
-// Helper: generate subscriptions for a student based on teacher's academic year
-
-
-// Sync a newly added month to all existing students of a teacher
-
-
 export const getStudentSubscriptions = async (req: AuthRequest, res: Response): Promise<void> => {
   const { studentId } = req.params;
   const student = await Student.findOne({ _id: studentId, ...subTeacherFilter(req) }).lean();
@@ -43,6 +31,7 @@ export const getBatchSubscriptions = async (req: AuthRequest, res: Response): Pr
   const raw = req.query.studentIds as string;
   if (!raw) { res.status(400).json({ message: "studentIds مطلوب" }); return; }
   const studentIds = raw.split(",").filter(Boolean);
+  if (studentIds.length > 500 || studentIds.some(id => !/^[a-f0-9]{24}$/i.test(id))) { res.status(400).json({ message: "قائمة الطلاب غير صحيحة" }); return; }
   if (studentIds.length === 0) { res.json({}); return; }
 
   // تحديد نطاق السنة الأكاديمية: الحالية + السابقة مباشرة
@@ -56,7 +45,7 @@ export const getBatchSubscriptions = async (req: AuthRequest, res: Response): Pr
   const subs = await MonthlySubscription.find({
     ...subTeacherFilter(req),
     student_id: { $in: studentIds },
-    year: { $in: validYears },
+    ...(req.query.allPeriods === "1" ? {} : { year: { $in: validYears } }),
   }).sort({ year: 1, month: 1 }).lean()
     .select("student_id month year status amount discount paid_at");
 
@@ -88,7 +77,7 @@ export const getAllTeacherSubscriptions = async (req: AuthRequest, res: Response
 
 // Auto-unsuspend: لو المتأخرات نزلت تحت الـ threshold يُفك الإيقاف تلقائياً
 async function checkAndAutoUnsuspend(studentId: string, teacherId: string, threshold = 3): Promise<void> {
-  const student = await Student.findOne({ _id: studentId, teacher_id: teacherId, is_suspended: true }).lean();
+  const student = await Student.findOne({ _id: studentId, teacher_id: teacherId, is_suspended: true, suspension_kind: "financial" }).lean();
   if (!student) return;
 
   const now = new Date();
@@ -101,7 +90,7 @@ async function checkAndAutoUnsuspend(studentId: string, teacherId: string, thres
 
   const overdueCount = dueSubs.filter((s) => s.year * 100 + s.month < nowDate).length;
 
-  if (overdueCount < threshold) {
+  if (overdueCount < (student.suspension_threshold || threshold)) {
     await Student.findByIdAndUpdate(studentId, {
       is_suspended: false,
       suspended_until: null,
@@ -110,7 +99,7 @@ async function checkAndAutoUnsuspend(studentId: string, teacherId: string, thres
   }
 }
 
-export const updateSubscription = async (req: AuthRequest, res: Response): Promise<void> => {
+export const updateSubscription = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const { id } = req.params;
 
   // SECURITY: amount and discount are server-calculated from the student's price
@@ -121,7 +110,7 @@ export const updateSubscription = async (req: AuthRequest, res: Response): Promi
   const updates: Record<string, unknown> = {};
 
   if (req.body.status !== undefined) updates.status = req.body.status;
-  if (req.body.paid_at !== undefined) updates.paid_at = req.body.paid_at;
+  // Payment timestamps are assigned by the server.
   if (req.body.receipt_number !== undefined) updates.receipt_number = req.body.receipt_number;
   if (req.body.notes !== undefined) updates.notes = req.body.notes;
 
@@ -141,7 +130,7 @@ export const updateSubscription = async (req: AuthRequest, res: Response): Promi
 
   const sub = await MonthlySubscription.findOneAndUpdate(
     { _id: id, ...subTeacherFilter(req) },
-    { $set: updates },
+    updates.status === "paid" ? [{ $set: { ...Object.fromEntries(Object.entries(updates).map(([field, value]) => [field, { $literal: value }])), paid_at: { $cond: [{ $eq: ["$status", "paid"] }, { $ifNull: ["$paid_at", new Date()] }, new Date()] } } }] : { $set: updates },
     { new: true }
   );
   if (!sub) { res.status(404).json({ message: "الاشتراك غير موجود" }); return; }
@@ -152,9 +141,9 @@ export const updateSubscription = async (req: AuthRequest, res: Response): Promi
 
   invalidateDashboardCache(String(sub.teacher_id));
   res.json(sub);
-};
+});
 
-export const bulkUpdateSubscriptions = async (req: AuthRequest, res: Response): Promise<void> => {
+export const bulkUpdateSubscriptions = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const { studentId } = req.params;
   const { updates } = req.body as { updates: { id: string; status: SubscriptionStatus }[] };
 
@@ -163,8 +152,16 @@ export const bulkUpdateSubscriptions = async (req: AuthRequest, res: Response): 
     return;
   }
 
+  const allowedStatuses = new Set(["due", "not_due", "paid", "exempt"]);
+  if (updates.length > 500 || new Set(updates.map(update => update.id)).size !== updates.length ||
+      updates.some(update => !allowedStatuses.has(update.status))) {
+    res.status(400).json({ message: "حالات الاشتراكات غير صالحة أو مكررة" }); return;
+  }
+
   const now = new Date();
   const filter = subTeacherFilter(req);
+  const ownedCount = await MonthlySubscription.countDocuments({ _id: { $in: updates.map(update => update.id) }, student_id: studentId, ...filter });
+  if (ownedCount !== updates.length) { res.status(404).json({ message: "بعض الاشتراكات لا تخص هذا الطالب" }); return; }
 
   // Build a single bulkWrite instead of N concurrent findOneAndUpdate calls.
   // This reduces N round-trips to 1 while preserving all authorization checks
@@ -176,16 +173,16 @@ export const bulkUpdateSubscriptions = async (req: AuthRequest, res: Response): 
     return {
       updateOne: {
         filter: { _id: id, student_id: studentId, ...filter } as Record<string, unknown>,
-        update: { $set: { status, ...extra } },
+        update: status === "paid" ? [{ $set: { status, paid_at: { $cond: [{ $eq: ["$status", "paid"] }, { $ifNull: ["$paid_at", now] }, now] } } }] : { $set: { status, ...extra } },
       },
     };
   });
 
-  await MonthlySubscription.bulkWrite(ops as any[], { ordered: false });
+  await MonthlySubscription.bulkWrite(ops as any[], { ordered: true });
 
   // Fetch updated docs to return to the client (same shape as before)
   const ids = updates.map((u) => u.id);
-  const results = await MonthlySubscription.find({ _id: { $in: ids }, ...filter }).lean();
+  const results = await MonthlySubscription.find({ _id: { $in: ids }, student_id: studentId, ...filter }).lean();
 
   const hasPaidOrExempt = updates.some((u) => u.status === "paid" || u.status === "exempt");
   if (hasPaidOrExempt) {
@@ -195,10 +192,10 @@ export const bulkUpdateSubscriptions = async (req: AuthRequest, res: Response): 
   }
 
   invalidateDashboardCache(req.user!.id);
-  res.json(results);
-};
+  res.json(results.map(doc => ({ ...doc, id: String(doc._id) })));
+});
 
-export const regenerateSubscriptions = async (req: AuthRequest, res: Response): Promise<void> => {
+export const regenerateSubscriptions = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const { studentId } = req.params;
   const student = await Student.findOne({ _id: studentId, ...subTeacherFilter(req) }).lean();
   if (!student) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
@@ -212,7 +209,7 @@ export const regenerateSubscriptions = async (req: AuthRequest, res: Response): 
 
   const subs = await MonthlySubscription.find({ student_id: studentId }).sort({ year: 1, month: 1 });
   res.json(subs);
-};
+});
 
 // Fix all due subscriptions amounts for the current teacher
 export const autoSuspendStudents = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -254,7 +251,7 @@ export const autoSuspendStudents = async (req: AuthRequest, res: Response): Prom
   const reason = `متأخرات لم تسدد (${threshold} شهور أو أكثر)`;
   await Student.updateMany(
     { _id: { $in: students.map(s => s._id) }, teacher_id: teacherId },
-    { is_suspended: true, suspended_until: null, suspension_reason: reason }
+    { is_suspended: true, suspension_kind: "financial", suspension_threshold: threshold, suspended_until: null, suspension_reason: reason }
   );
 
   res.json({
@@ -263,17 +260,15 @@ export const autoSuspendStudents = async (req: AuthRequest, res: Response): Prom
   });
 };
 
-// Sync all students of a teacher with the current active_months (shared helper + endpoint)
 
-
-export const syncAllStudents = async (req: AuthRequest, res: Response): Promise<void> => {
+export const syncAllStudents = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const teacherId = req.user!.id;
   const synced = await syncAllStudentsForTeacher(teacherId);
   res.json({ synced });
-};
+});
 
 // إصلاح بيانات rollover خاطئة: مسح الشهور المستقبلية من active_month_years وحذف اشتراكاتها
-export const fixRolloverData = async (req: AuthRequest, res: Response): Promise<void> => {
+export const fixRolloverData = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const teacherId = req.user!.id;
   const teacher = await Teacher.findById(teacherId).lean();
   if (!teacher) { res.status(404).json({ message: "المعلم غير موجود" }); return; }
@@ -314,10 +309,10 @@ export const fixRolloverData = async (req: AuthRequest, res: Response): Promise<
   }
 
   res.json({ fixed: fixed.length, removedYears, deletedSubscriptions: deletedCount });
-};
+});
 
 // تجديد السنة الأكاديمية: مسح سنة قديمة من active_month_years وإضافة سنة جديدة
-export const rolloverAcademicYear = async (req: AuthRequest, res: Response): Promise<void> => {
+export const rolloverAcademicYear = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const teacherId = req.user!.id;
   const teacher = await Teacher.findById(teacherId).lean();
   if (!teacher) { res.status(404).json({ message: "المعلم غير موجود" }); return; }
@@ -357,7 +352,7 @@ export const rolloverAcademicYear = async (req: AuthRequest, res: Response): Pro
   const synced = await syncAllStudentsForTeacher(teacherId);
 
   res.json({ oldestYear, newYear, synced, active_month_years: updated });
-};
+});
 
 export const fixSubscriptionAmounts = async (req: AuthRequest, res: Response): Promise<void> => {
   const teacherId = req.user!.id;
@@ -484,5 +479,86 @@ export const getSubscriptionsSummary = async (req: AuthRequest, res: Response): 
   ];
 
   const results = await MonthlySubscription.aggregate(pipeline as any[]);
-  res.json(results);
+  res.json(results.map(doc => ({ ...doc, id: String(doc._id) })));
+};
+
+
+/** Dedicated scanner payment: validate the displayed amounts and current status atomically. */
+export const paySubscriptions = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
+  const { studentId } = req.params;
+  const items = req.body?.items;
+  const autoPeriod = req.body?.autoPeriod;
+  const key = req.headers["idempotency-key"];
+  if (typeof key !== "string" || !key || !Array.isArray(items) || !items.length || items.length > 120 ||
+      items.some(item => !item || !/^[a-f\d]{24}$/i.test(item.id) || !Number.isFinite(item.amount) || !Number.isFinite(item.discount)) ||
+      new Set(items.map(item => item.id)).size !== items.length) {
+    res.status(400).json({ message: "بيانات عملية الدفع غير صالحة" }); return;
+  }
+  const student = await Student.findOne({ _id: studentId, ...teacherFilter(req) });
+  if (!student) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
+  const requestHash = createHash("sha256").update(JSON.stringify({ studentId, ...(autoPeriod ? {autoPeriod} : {}), items: [...items].sort((a, b) => a.id.localeCompare(b.id)).map(({ id, amount, discount }) => ({ id, amount, discount })) })).digest("hex");
+  const previous = await SubscriptionPayment.findOne({ teacher_id: student.teacher_id, operation_key: key }).lean();
+  if (previous) {
+    if (previous.request_hash !== requestHash) { res.status(409).json({ message: "مفتاح الدفع مستخدم لعملية أخرى" }); return; }
+    res.json(previous.response); return;
+  }
+  const docs = await MonthlySubscription.find({ _id: { $in: items.map(item => item.id) }, student_id: studentId, teacher_id: student.teacher_id });
+  if (docs.length !== items.length) { res.status(404).json({ message: "بعض الاشتراكات لا تخص هذا الطالب" }); return; }
+  if (autoPeriod !== undefined) {
+    if (!autoPeriod || !Number.isInteger(autoPeriod.month) || autoPeriod.month < 1 || autoPeriod.month > 12 ||
+        !Number.isInteger(autoPeriod.year) || autoPeriod.year < 2000 || autoPeriod.year > 2100) {
+      res.status(400).json({ message: "فترة الدفع التلقائي غير صالحة" }); return;
+    }
+    const earlier = await MonthlySubscription.exists({student_id: studentId, teacher_id: student.teacher_id, status: "due",
+      $or: [{year: {$lt: autoPeriod.year}}, {year: autoPeriod.year, month: {$lt: autoPeriod.month}}]});
+    if (student.is_suspended || earlier || docs.length !== 1 || docs[0].month !== autoPeriod.month ||
+        docs[0].year !== autoPeriod.year || docs[0].amount - docs[0].discount <= 0) {
+      res.status(409).json({message: "هذه الحالة تحتاج مراجعة وتأكيد يدوي. أعد تحميل مستحقات الطالب."}); return;
+    }
+  }
+  if (docs.some(doc => {
+    const expected = items.find(item => item.id === String(doc._id));
+    return doc.status !== "due" || doc.amount !== expected.amount || doc.discount !== expected.discount ||
+      !Number.isFinite(doc.amount) || !Number.isFinite(doc.discount) || doc.amount < 0 || doc.discount < 0 || doc.discount > doc.amount;
+  })) { res.status(409).json({ message: "تغيرت حالة الشهور أو مبالغها. أعد تحميل بيانات الطالب قبل الدفع." }); return; }
+  const paidAt = new Date();
+  await MonthlySubscription.updateMany({ _id: { $in: docs.map(doc => doc._id) }, teacher_id: student.teacher_id, status: "due" }, { $set: { status: "paid", paid_at: paidAt, receipt_number: key } });
+  const subscriptions = await MonthlySubscription.find({ student_id: studentId, teacher_id: student.teacher_id }).sort({ year: 1, month: 1 });
+  // Reuse the owned student and subscriptions already read in this transaction.
+  // Most payments need no additional student query or write.
+  let updatedStudent = student;
+  if (student.is_suspended && student.suspension_kind === "financial") {
+    const currentPeriod = paidAt.getFullYear() * 100 + paidAt.getMonth() + 1;
+    const overdue = subscriptions.filter(sub => sub.status === "due" && sub.year * 100 + sub.month < currentPeriod).length;
+    if (overdue < (student.suspension_threshold || 3)) {
+      updatedStudent = await Student.findOneAndUpdate(
+        { _id: studentId, teacher_id: student.teacher_id, is_suspended: true, suspension_kind: "financial" },
+        { $set: { is_suspended: false, suspended_until: null, suspension_reason: null } },
+        { new: true },
+      ) || student;
+    }
+  }
+  const receipt = {
+    id: key, name: student.name, code: student.center_student_code || student.code || "",
+    amount: docs.reduce((total, doc) => total + doc.amount - doc.discount, 0),
+    months: docs.map(doc => ({ month: doc.month, year: doc.year })), created_at: paidAt.toISOString(),
+  };
+  const response = { receipt, student: updatedStudent?.toJSON(), subscriptions: subscriptions.map(doc => doc.toJSON()) };
+  await SubscriptionPayment.create({ teacher_id: student.teacher_id, student_id: studentId, operation_key: key, request_hash: requestHash, ...receipt, response });
+  invalidateDashboardCache(String(student.teacher_id));
+  res.json(response);
+});
+
+export const getRecentPayments = async (req: AuthRequest, res: Response): Promise<void> => {
+  const docs = await SubscriptionPayment.find(teacherFilter(req)).sort({ created_at: -1 }).limit(30).select("operation_key name code amount months created_at").lean();
+  res.json(docs.map(doc => ({ id: doc.operation_key, name: doc.name, code: doc.code, amount: doc.amount, months: doc.months, created_at: doc.created_at })));
+};
+
+export const lookupPaymentStudent = async (req: AuthRequest, res: Response): Promise<void> => {
+  const raw = req.query.qr;
+  if (typeof raw !== "string" || !raw.trim() || raw.length > 2048) { res.status(400).json({ message: "كود الطالب غير صالح" }); return; }
+  const student = await findScannedStudent(teacherFilter(req), { student_code: raw });
+  if (!student) { res.status(404).json({ message: "كود الطالب غير موجود أو غير محدد بشكل واضح" }); return; }
+  const subscriptions = await MonthlySubscription.find({ student_id: student._id, teacher_id: student.teacher_id }).sort({ year: 1, month: 1 });
+  res.json({ student: { ...student, id: String(student._id) }, subscriptions: subscriptions.map(doc => doc.toJSON()) });
 };

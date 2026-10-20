@@ -1,7 +1,8 @@
 import { StudentMembership } from "../models/StudentMembership";
+import { SiblingFamily } from "../models/SiblingFamily";
 import { atomicController, series } from "../services/atomicController";
 import { findScannedStudent } from "../utils/studentScan";
-import { validateOwnedReferences, groupMatchesGrade, validStudentDiscounts } from "../utils/ownedReferences";
+import { validateOwnedReferences, validStudentDiscounts } from "../utils/ownedReferences";
 import { Response } from "express";
 import { Student } from "../models/Student";
 import { Group } from "../models/Group";
@@ -10,18 +11,19 @@ import { AttendanceRecord } from "../models/AttendanceRecord";
 import { ExamGrade } from "../models/Exam";
 import { AuthRequest, getAdminTeacherFilter, teacherFilter } from "../middleware/auth";
 import { generateSubscriptionsForStudent } from "../services/subscriptionLifecycle";
-import { allocateStudentCode, buildStudentCode, resolveBasePrice, syncDueSubscriptions, resolveOrCreateCenterStudent } from "./students.helpers";
+import { allocateStudentCode, resolveBasePrice, syncDueSubscriptions, resolveOrCreateCenterStudent, calcDiscount } from "./students.helpers";
 import { Teacher } from "../models/Teacher";
 import { getTodayInTimezone } from "../utils/timezoneUtils";
 
 import mongoose from "mongoose";
+import { validStudentName } from "../utils/studentName";
 
 // الحقول المسموح للـ client بتعديلها فقط
 const STUDENT_UPDATABLE_FIELDS = new Set([
   "name", "grade_id", "group_id", "parent_phone", "parent_job",
   "student_email", "notes", "discount_value", "discount_reason",
   "apply_discount_to_books", "book_discount_value", "custom_monthly_price",
-  "received_books", "months",
+  "received_books", "subscription_start_month", "subscription_start_year",
 ]);
 
 /** حذف الطالب وكل بياناته المرتبطة.
@@ -30,7 +32,7 @@ const STUDENT_UPDATABLE_FIELDS = new Set([
  *  - ExamGrade: تُحذف — درجات بدون طالب لا معنى لها.
  *  - BookSale: لا تُحذف — سجل مالي تاريخي مرتبط بالكتاب والمدرس.
  */
-async function deleteStudentCascade(studentId:string, centerStudentId?:string|null):Promise<void>{
+export async function deleteStudentCascade(studentId:string, centerStudentId?:string|null):Promise<void>{
  await MonthlySubscription.deleteMany({student_id:studentId,status:{$in:["due","not_due"]}});
  await AttendanceRecord.deleteMany({student_id:studentId});
  await ExamGrade.deleteMany({student_id:studentId});
@@ -47,6 +49,7 @@ const LISTING_FIELDS = [
   "sibling_family_id", "sibling_family_name",
   "family_discount_percent", "discount_value", "custom_monthly_price",
   "received_books", "subscription_start_month", "subscription_start_year",
+  "group_join_date", "created_at",
   "teacher_id",
 ].join(" ");
 
@@ -75,7 +78,7 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const MAX_LIMIT = 100;
+    const MAX_LIMIT = 5000;
     const page = Math.max(1, parseInt(pageParam as string) || 1);
     const limit = Math.min(MAX_LIMIT, Math.max(1, parseInt(limitParam as string) || 20));
     const skip = (page - 1) * limit;
@@ -84,13 +87,15 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
 
     if (req.query.search) {
       const q = String(req.query.search).trim();
+      const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const isCode = /^[A-Za-z0-9\-]+$/.test(q);
       if (isCode) {
-        // بحث بالكود — regex على code بس
-        filter.code = { $regex: q, $options: "i" };
+        filter.$or = [
+          { code: { $regex: escaped, $options: "i" } },
+          { name: { $regex: escaped, $options: "i" } },
+        ];
       } else {
-        // بحث بالاسم — $text index أسرع بكتير من $regex
-        filter.$text = { $search: q };
+        filter.name = { $regex: escaped, $options: "i" };
       }
     }
     if (req.query.group_id) {
@@ -100,8 +105,13 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
       filter.grade_id = req.query.grade_id;
     }
 
+    if (req.query.sub_teacher_id) {
+      if (!mongoose.isValidObjectId(req.query.sub_teacher_id)) { res.status(400).json({ message: "معرف المعلم غير صحيح" }); return; }
+      const ownedGroups = await Group.find({ ...teacherFilter(req), sub_teacher_id: req.query.sub_teacher_id }).select("_id").lean();
+      filter.$and = [{ group_id: { $in: ownedGroups.map(g => g._id) } }];
+    }
     const [students, total] = await Promise.all([
-      Student.find(filter).select(fields || LISTING_FIELDS).sort({ code: 1 }).skip(skip).limit(limit).lean(),
+      Student.find(filter).select(fields || LISTING_FIELDS).sort({ code: 1, _id: 1 }).skip(skip).limit(limit).lean(),
       Student.countDocuments(filter),
     ]);
 
@@ -166,27 +176,38 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
     } else {
       teacherId = u.id;
     }
-    if (!await groupMatchesGrade(teacherId, req.body.group_id, req.body.grade_id)) { res.status(400).json({ message: "يجب أن تكون المجموعة في نفس الصف الدراسي للطالب" }); return; }
-    if (!await validateOwnedReferences(teacherId, req.body)) { res.status(403).json({ message: "المجموعة أو المرحلة لا تنتمي للمدرس" }); return; }
+    const enrollmentGroup = req.body.group_id ? await Group.findOne({ _id: req.body.group_id, teacher_id: teacherId }).lean() : null;
+    if (req.body.group_id && (!enrollmentGroup || String(enrollmentGroup.grade_id) !== String(req.body.grade_id || ""))) { res.status(400).json({ message: "يجب أن تكون المجموعة في نفس الصف الدراسي للطالب" }); return; }
+    if (!await validateOwnedReferences(teacherId, { ...req.body, group_id: null })) { res.status(403).json({ message: "المجموعة أو المرحلة لا تنتمي للمدرس" }); return; }
     if (!validStudentDiscounts(req.body)) { res.status(400).json({ message: "نسبة الخصم يجب أن تكون رقمًا بين 0 و100" }); return; }
-    const studentData = { ...req.body, teacher_id: teacherId };
+    if (!validStudentName(req.body.name)) { res.status(400).json({ message: "اسم الطالب يجب أن يكون حروفًا واسمين على الأقل" }); return; }
+    const studentData: Record<string, any> = { teacher_id: teacherId };
+    const creationFields = [
+      ...STUDENT_UPDATABLE_FIELDS,
+      "subscription_start_month", "subscription_start_year",
+      "join_family_id", "create_new_family", "sibling_family_name", "center_student_code",
+    ];
+    for (const field of creationFields) {
+      if (Object.prototype.hasOwnProperty.call(req.body, field)) studentData[field] = req.body[field];
+    }
     // Set group_join_date when student is added with a group
     if (studentData.group_id && !studentData.group_join_date) {
       studentData.group_join_date = getTodayInTimezone();
     }
 
+    let knownFamilyMember: any = null;
     // ── Family auto-assign ──────────────────────────────────────────────────
     if (studentData.join_family_id) {
-      studentData.sibling_family_id = studentData.join_family_id;
-      if (!studentData.sibling_family_name) {
-        const existingMember = await Student.findOne({
-          teacher_id: teacherId,
-          sibling_family_id: studentData.join_family_id,
-        });
-        if (existingMember?.sibling_family_name) {
-          studentData.sibling_family_name = existingMember.sibling_family_name;
-        }
+      const member = await Student.findOne({ teacher_id: teacherId, sibling_family_id: studentData.join_family_id });
+      knownFamilyMember = member;
+      const family = !member && mongoose.isObjectIdOrHexString(studentData.join_family_id)
+        ? await SiblingFamily.findOne({ _id: studentData.join_family_id, teacher_id: teacherId }) : null;
+      if (!member && !family) {
+        res.status(400).json({ message: "العائلة غير موجودة لدى هذا المدرس" });
+        return;
       }
+      studentData.sibling_family_id = studentData.join_family_id;
+      studentData.sibling_family_name = member?.sibling_family_name || family?.family_name || null;
     } else if (studentData.create_new_family && studentData.parent_phone) {
       studentData.sibling_family_id = `FAM_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
       if (!studentData.sibling_family_name) {
@@ -203,7 +224,10 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
         parent_phone: studentData.parent_phone,
         sibling_family_id: { $ne: null },
       });
-      if (existing) studentData.sibling_family_id = existing.sibling_family_id;
+      if (existing) {
+        studentData.sibling_family_id = existing.sibling_family_id;
+        knownFamilyMember = existing;
+      }
     }
     delete studentData.join_family_id;
     delete studentData.create_new_family;
@@ -216,7 +240,7 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
     delete studentData.center_student_code;
     delete studentData.center_student_id;
 
-    const teacher = await Teacher.findById(teacherId).select("center_id").lean() as any;
+    const teacher = await Teacher.findById(teacherId).select("center_id academic_year monthly_price").lean() as any;
     if (teacher?.center_id) {
       const centerId = String(teacher.center_id);
       const name        = String(studentData.name || "");
@@ -250,8 +274,7 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
 
     // ── Auto-generate code ──────────────────────────────────────────────────
     if (studentData.group_id) {
-      const group = await Group.findById(studentData.group_id);
-      const groupCode = group?.code || null;
+      const groupCode = enrollmentGroup?.code || null;
       if (groupCode) {
         studentData.code = await allocateStudentCode(teacherId, String(studentData.group_id), groupCode);
       } else {
@@ -263,7 +286,7 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
 
     // ── Inherit family discount before creating ─────────────────────────────
     if (studentData.sibling_family_id && !studentData.family_discount_percent) {
-      const familyMember = await Student.findOne({
+      const familyMember = knownFamilyMember || await Student.findOne({
         teacher_id: teacherId,
         sibling_family_id: studentData.sibling_family_id,
       }).lean();
@@ -275,6 +298,7 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
       }
     }
 
+    let createdSubscriptions: any[] = [];
     const student = await (async () => {
       const created = await Student.create(studentData);
       const todayStr = getTodayInTimezone();
@@ -282,16 +306,17 @@ export const addStudent = atomicController(async (req: AuthRequest, res: Respons
       const startMonth = Number(studentData.subscription_start_month) || todayMonth;
       const startYear = Number(studentData.subscription_start_year) || todayYear;
       // The generator already applies the student's family/individual discount.
-      await generateSubscriptionsForStudent(String(created._id), studentData.teacher_id, startMonth, startYear);
+      const base = Number(created.custom_monthly_price) > 0 ? Number(created.custom_monthly_price) : Number(enrollmentGroup?.monthly_price) > 0 ? Number(enrollmentGroup?.monthly_price) : Number(teacher?.monthly_price) || 0;
+      createdSubscriptions = await generateSubscriptionsForStudent(String(created._id), studentData.teacher_id, startMonth, startYear, teacher?.academic_year?.active_months || [8,9,10,11,12,1,2,3,4,5], teacher?.academic_year?.active_month_years, undefined, created, { price: calcDiscount(base, created.family_discount_percent, created.discount_value), newlyCreated: true }) || [];
       if (created.group_id) await StudentMembership.create({ student_id: created._id, teacher_id: teacherId, group_id: created.group_id, grade_id: created.grade_id, starts_on: created.group_join_date, ends_on: null, actor_id: req.user!.actor_id || req.user!.id, reason: "enrollment" });
       return created;
     })();
 
-    const subscriptions = await MonthlySubscription.find({ student_id: student._id }).sort({ year: 1, month: 1 }).lean();
+    const subscriptions = createdSubscriptions.map(s => s.toObject()).sort((a, b) => a.year - b.year || a.month - b.month);
     res.status(201).json({ ...student.toObject(), id: String(student._id), _subscriptions: subscriptions.map(({ _id, __v, ...rest }: any) => ({ id: String(_id), ...rest })) });
   } catch (error: any) {
-    if (error?.hasErrorLabel?.("TransientTransactionError")) throw error;
-    res.status(500).json({ message: "حدث خطأ أثناء إضافة الطالب" });
+    // Preserve transient database errors for transaction retry / HTTP 503.
+    throw error;
   }
 });
 
@@ -304,18 +329,26 @@ export const updateStudent = atomicController(async (req: AuthRequest, res: Resp
     }
 
     if (!validStudentDiscounts(safeBody)) { res.status(400).json({ message: "نسبة الخصم يجب أن تكون رقمًا بين 0 و100" }); return; }
+    if ("name" in safeBody && !validStudentName(safeBody.name)) { res.status(400).json({ message: "اسم الطالب يجب أن يكون حروفًا واسمين على الأقل" }); return; }
+    if (("subscription_start_month" in safeBody && (!Number.isInteger(safeBody.subscription_start_month) || Number(safeBody.subscription_start_month) < 1 || Number(safeBody.subscription_start_month) > 12)) ||
+        ("subscription_start_year" in safeBody && (!Number.isInteger(safeBody.subscription_start_year) || Number(safeBody.subscription_start_year) < 2000 || Number(safeBody.subscription_start_year) > 2100))) {
+      res.status(400).json({ message: "تاريخ بداية الاشتراك غير صحيح" }); return;
+    }
 
     // Verify the student belongs to an allowed teacher
     const existing = await Student.findOne({ _id: req.params.id, ...teacherFilter(req) }).lean();
     if (!existing) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
     const teacherId = (existing as any).teacher_id.toString();
-    if (!await validateOwnedReferences(teacherId, safeBody)) { res.status(403).json({ message: "المجموعة أو المرحلة لا تنتمي للمدرس" }); return; }
+    if (!await validateOwnedReferences(teacherId, { ...safeBody, group_id: null })) { res.status(403).json({ message: "المجموعة أو المرحلة لا تنتمي للمدرس" }); return; }
 
     const targetGroup = "group_id" in safeBody ? safeBody.group_id : existing.group_id;
     const targetGrade = "grade_id" in safeBody ? safeBody.grade_id : existing.grade_id;
+    // Reuse the owned group for validation, code allocation and pricing.
+    const targetGroupDoc = targetGroup ? await Group.findOne({ _id: targetGroup, teacher_id: teacherId }).lean() : null;
+    if (targetGroup && !targetGroupDoc) { res.status(403).json({ message: "المجموعة أو المرحلة لا تنتمي للمدرس" }); return; }
     const transferring = !!targetGroup && String(targetGroup) !== String(existing.group_id || "");
     if ((transferring && String(targetGrade || "") !== String(existing.grade_id || "")) ||
-        !await groupMatchesGrade(teacherId, targetGroup, targetGrade)) {
+        (targetGroup && (!targetGroupDoc || !targetGrade || String(targetGroupDoc.grade_id) !== String(targetGrade)))) {
       res.status(400).json({ message: "يجب أن تكون المجموعة في نفس الصف الدراسي للطالب" }); return;
     }
 
@@ -327,8 +360,7 @@ export const updateStudent = atomicController(async (req: AuthRequest, res: Resp
       if (newGroupId !== oldGroupId) {
         safeBody.group_join_date = newGroupId ? getTodayInTimezone() : null;
         if (newGroupId) {
-          const group = await Group.findById(newGroupId);
-          const groupCode = group?.code || null;
+          const groupCode = targetGroupDoc?.code || null;
           if (groupCode) {
             safeBody.code = await allocateStudentCode(teacherId, String(newGroupId), groupCode);
           } else {
@@ -349,9 +381,8 @@ export const updateStudent = atomicController(async (req: AuthRequest, res: Resp
 
     if ("group_id" in safeBody && String(safeBody.group_id || "") !== String(existing.group_id || "")) {
       const today=getTodayInTimezone();
-      const active=await StudentMembership.findOne({student_id:student._id,ends_on:null});
-      if(active) await StudentMembership.updateOne({_id:active._id},{$set:{ends_on:today}});
-      else if(existing.group_id) await StudentMembership.create({student_id:student._id,teacher_id:teacherId,group_id:existing.group_id,grade_id:existing.grade_id,starts_on:existing.group_join_date || new Date(existing.created_at).toLocaleDateString("en-CA",{timeZone:"Africa/Cairo"}),ends_on:today,reason:"imported current membership"});
+      const closed=await StudentMembership.updateOne({student_id:student._id,teacher_id:teacherId,ends_on:null},{$set:{ends_on:today}});
+      if(!closed.matchedCount && existing.group_id) await StudentMembership.create({student_id:student._id,teacher_id:teacherId,group_id:existing.group_id,grade_id:existing.grade_id,starts_on:existing.group_join_date || new Date(existing.created_at).toLocaleDateString("en-CA",{timeZone:"Africa/Cairo"}),ends_on:today,reason:"imported current membership"});
       if(student.group_id)await StudentMembership.create({student_id:student._id,teacher_id:teacherId,group_id:student.group_id,grade_id:student.grade_id,starts_on:today,ends_on:null,actor_id:req.user!.actor_id || req.user!.id,reason:"group transfer"});
     }
     // ── Sync subscriptions if price-affecting fields changed ───────────────
@@ -361,7 +392,9 @@ export const updateStudent = atomicController(async (req: AuthRequest, res: Resp
       ("group_id" in safeBody && safeBody.group_id !== (existing as any).group_id?.toString());
 
     if (priceChanged) {
-      const basePrice = await resolveBasePrice(student.custom_monthly_price, student.group_id, teacherId);
+      const basePrice = Number(student.custom_monthly_price) > 0 ? Number(student.custom_monthly_price)
+        : Number(targetGroupDoc?.monthly_price) > 0 ? Number(targetGroupDoc?.monthly_price)
+        : await resolveBasePrice(null, null, teacherId);
       await syncDueSubscriptions(
         student._id,
         teacherId,
@@ -371,11 +404,20 @@ export const updateStudent = atomicController(async (req: AuthRequest, res: Resp
       );
     }
 
+    if ("subscription_start_month" in safeBody || "subscription_start_year" in safeBody) {
+      const month = Number(student.subscription_start_month);
+      const year = Number(student.subscription_start_year);
+      await MonthlySubscription.updateMany({ student_id: student._id, teacher_id: teacherId, status: "due", $or: [{ year: { $lt: year } }, { year, month: { $lt: month } }] }, { $set: { status: "not_due" } });
+      await generateSubscriptionsForStudent(String(student._id), teacherId, month, year, undefined, undefined, undefined, student);
+    }
+    if ("group_id" in safeBody) {
+      const subscriptions = await MonthlySubscription.find({ student_id: student._id, teacher_id: teacherId }).sort({ year: 1, month: 1 }).lean();
+      res.json({ ...student.toObject(), id: String(student._id), _subscriptions: subscriptions.map(({ _id, __v, ...rest }: any) => ({ id: String(_id), ...rest })) });
+      return;
+    }
     res.json(student);
   } catch (err: any) {
-    if (err?.hasErrorLabel?.("TransientTransactionError")) throw err;
-    console.error("[updateStudent] error:", err);
-    res.status(500).json({ message: "حدث خطأ أثناء تحديث الطالب" });
+    throw err;
   }
 });
 

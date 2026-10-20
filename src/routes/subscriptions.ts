@@ -3,6 +3,9 @@ import { protect } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
 import {
   getStudentSubscriptions,
+  paySubscriptions,
+  lookupPaymentStudent,
+  getRecentPayments,
   getBatchSubscriptions,
   getAllTeacherSubscriptions,
   updateSubscription,
@@ -19,6 +22,9 @@ const router = Router();
 router.use(protect);
 
 router.get("/", asyncHandler(getAllTeacherSubscriptions));
+router.get("/lookup", asyncHandler(lookupPaymentStudent));
+router.get("/payments/recent", asyncHandler(getRecentPayments));
+router.post("/student/:studentId/pay", asyncHandler(paySubscriptions));
 router.get("/summary", asyncHandler(getSubscriptionsSummary));
 router.get("/batch", asyncHandler(getBatchSubscriptions));
 router.get("/student/:studentId", asyncHandler(getStudentSubscriptions));

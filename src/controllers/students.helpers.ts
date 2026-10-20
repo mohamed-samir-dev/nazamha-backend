@@ -1,4 +1,4 @@
-import { nextSequence } from "../services/counters";
+import { nextSequence, reserveSequence } from "../services/counters";
 import { Group } from "../models/Group";
 import { Teacher } from "../models/Teacher";
 import { Center } from "../models/Center";
@@ -257,7 +257,6 @@ export async function syncDueSubscriptions(
   familyPct: number | null | undefined,
   individualPct: number | null | undefined
 ): Promise<void> {
-  if (!basePrice) return;
   const { amount, discount } = calcDiscount(basePrice, familyPct, individualPct);
   await MonthlySubscription.updateMany(
     { student_id: studentId, teacher_id: teacherId, status: { $in: ["due", "not_due"] } },
@@ -266,9 +265,12 @@ export async function syncDueSubscriptions(
 }
 
 export async function allocateStudentCode(teacherId:string, groupId:string, prefix:string):Promise<string>{
- const seq=await nextSequence("student:"+teacherId+":"+groupId,async()=>{
+ return (await allocateStudentCodes(teacherId,groupId,prefix,1))[0];
+}
+export async function allocateStudentCodes(teacherId:string, groupId:string, prefix:string,count:number):Promise<string[]>{
+ const seq=await reserveSequence("student:"+teacherId+":"+groupId,count,async()=>{
   const students=await Student.find({teacher_id:teacherId,group_id:groupId}).select("code").lean();
   return Math.max(0,...students.map(s=>Number((s.code||"").match(/-(\d+)$/)?.[1])||0));
  });
- return prefix+"-"+String(seq).padStart(4,"0");
+ return Array.from({length:count},(_,offset)=>prefix+"-"+String(seq+offset).padStart(4,"0"));
 }

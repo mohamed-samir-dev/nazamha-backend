@@ -1,4 +1,5 @@
 {
   "extends": "./tsconfig.json",
+  "include": ["src/app.ts", "src/workers/index.ts"],
   "exclude": ["node_modules", "dist", "src/__tests__", "src/benchmark", "src/seed.ts", "src/seedTeacher.ts", "src/createAdmin.ts"]
 }

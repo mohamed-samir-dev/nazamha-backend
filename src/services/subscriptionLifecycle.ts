@@ -70,12 +70,14 @@ export async function generateSubscriptionsForStudent(
   startYear: number,
   activeMonths?: number[],
   activeMonthYears?: { month: number; year: number }[],
-  session?: ClientSession
-): Promise<void> {
+  session?: ClientSession,
+  knownStudent?: any,
+  context?: { price: { amount: number; discount: number }; newlyCreated?: boolean }
+): Promise<any[] | void> {
   if (startMonth < 1 || startMonth > 12) return;
 
   const [student, teacher] = await series([
-    Student.findById(studentId).setOptions(session ? { session } : {}).lean(),
+    knownStudent ? Promise.resolve(knownStudent) : Student.findById(studentId).setOptions(session ? { session } : {}).lean(),
     (activeMonths || activeMonthYears) ? Promise.resolve(null) : Teacher.findById(teacherId).lean(),
   ]);
 
@@ -93,12 +95,20 @@ export async function generateSubscriptionsForStudent(
     resolved = resolveMonthYears(months, startMonth, startYear);
   }
 
-  const { amount, discount } = student ? await resolveStudentPrice(student, teacherId) : { amount: 0, discount: 0 };
+  const { amount, discount } = context?.price ?? (student ? await resolveStudentPrice(student, teacherId) : { amount: 0, discount: 0 });
   if (resolved.length === 0) return;
+
+  // A new student has no subscriptions to merge. Return the inserted records so
+  // creation can respond without reading the same records back over the network.
+  if (context?.newlyCreated) {
+    return MonthlySubscription.insertMany(resolved.map(({ month, year, status }) => ({
+      student_id: studentId, teacher_id: teacherId, month, year, status, amount, discount,
+    })), { ordered: true, ...(session ? { session } : {}) });
+  }
 
   // جلب كل الاشتراكات الموجودة بـ query واحد بدل N queries
   const years = [...new Set(resolved.map((r) => r.year))];
-  const existingDocs = await MonthlySubscription.find({
+  const existingDocs = context?.newlyCreated ? [] : await MonthlySubscription.find({
     student_id: studentId,
     month: { $in: resolved.map((r) => r.month) },
     year: { $in: years },
@@ -147,7 +157,7 @@ export async function syncNewMonthForAllStudents(
   // Fetch all needed data in 3 queries instead of N queries inside resolveStudentPrice.
   const eligibleStudents = await Student.find({ _id: { $in: newIds }, teacher_id: teacherId }).lean();
   const groupIds = [...new Set(eligibleStudents.map((s: any) => s.group_id).filter(Boolean).map(String))];
-  const [groups, teacher] = await Promise.all([
+  const [groups, teacher] = await series([
     groupIds.length ? Group.find({ _id: { $in: groupIds } }).lean().select("_id monthly_price") : Promise.resolve([]),
     Teacher.findById(teacherId).lean().select("monthly_price"),
   ]);
@@ -182,7 +192,7 @@ export async function syncNewMonthForAllStudents(
     };
   });
 
-  if (ops.length > 0) await MonthlySubscription.bulkWrite(ops as any[], { ordered: false });
+  if (ops.length > 0) await MonthlySubscription.bulkWrite(ops as any[], { ordered: true });
 }
 
 export async function syncAllStudentsForTeacher(teacherId: string): Promise<number> {
@@ -231,7 +241,7 @@ export async function syncAllStudentsForTeacher(teacherId: string): Promise<numb
   const groupIds = [...new Set(
     students.map((s: any) => s.group_id).filter(Boolean).map(String)
   )];
-  const [groups] = await Promise.all([
+  const [groups] = await series([
     groupIds.length
       ? Group.find({ _id: { $in: groupIds } }).lean().select("_id monthly_price")
       : Promise.resolve([]),
@@ -306,7 +316,7 @@ export async function syncAllStudentsForTeacher(teacherId: string): Promise<numb
 
   // ── 6. bulkWrite واحد لكل الطلاب ─────────────────────────────────────────
   if (ops.length > 0) {
-    await MonthlySubscription.bulkWrite(ops as any[], { ordered: false });
+    await MonthlySubscription.bulkWrite(ops as any[], { ordered: true });
   }
 
   return students.length;

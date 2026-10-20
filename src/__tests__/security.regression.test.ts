@@ -2,6 +2,8 @@ jest.mock("../services/counters", () => ({ nextSequence: jest.fn().mockResolvedV
 jest.mock("../services/atomicController", () => ({ atomicController: (handler: unknown) => handler, series: (queries: PromiseLike<unknown>[]) => Promise.all(queries) }));
 import { CenterStudent } from "../models/CenterStudent";
 import { StudentMembership } from "../models/StudentMembership";
+import { SiblingFamily } from "../models/SiblingFamily";
+import { renameFamiliy } from "../controllers/students.siblings.controller";
 import { resolveOrCreateCenterStudent } from "../controllers/students.helpers";
 import { Response, NextFunction } from "express";
 import { AuthRequest, protect, teacherFilter } from "../middleware/auth";
@@ -21,7 +23,7 @@ import { StudentShareToken } from "../models/StudentShareToken";
 import { isTokenRevoked } from "../services/tokenBlacklist";
 import jwt from "jsonwebtoken";
 import { getTeacherById, updateTeacher } from "../controllers/teachersController";
-import { deleteGroupsBulk } from "../controllers/groupsController";
+import { deleteGroup, deleteGroupsBulk, updateGroupsByGrade } from "../controllers/groupsController";
 import { updateSubscription } from "../controllers/subscriptionsController";
 import { updateStudent } from "../controllers/students.crud.controller";
 import { getSalaries, confirmSalaryPayment } from "../controllers/salariesController";
@@ -44,6 +46,61 @@ const res = (): any => ({ statusCode: 200, locals: {}, status(n: number) { this.
 afterEach(() => jest.restoreAllMocks());
 
 describe("tenant boundaries", () => {
+  test("bulk grade pricing updates unpaid subscriptions with discounts and tenant scope", async () => {
+    jest.spyOn(Group, "find").mockReturnValue(chain([{ _id: G, teacher_id: A }]));
+    jest.spyOn(Group, "updateMany").mockResolvedValue({ modifiedCount: 1 } as any);
+    const students = jest.spyOn(Student, "find").mockReturnValue(chain([{ _id: S, family_discount_percent: 20, discount_value: 10 }]));
+    const write = jest.spyOn(MonthlySubscription, "bulkWrite").mockResolvedValue({} as any);
+    const response = res();
+    await updateGroupsByGrade(req({ params: { gradeId: G }, body: { monthly_price: 300 } }), response);
+    expect(response.statusCode).toBe(200);
+    expect(students).toHaveBeenCalledWith(expect.objectContaining({ teacher_id: A, group_id: { $in: [G] }, custom_monthly_price: { $in: [null, false, 0] } }), expect.anything());
+    expect(write).toHaveBeenCalledWith([{ updateMany: {
+      filter: { student_id: S, teacher_id: A, status: { $in: ["due", "not_due"] } },
+      update: { amount: 300, discount: 60 },
+    } }]);
+  });
+  test("group cascade rejects history before deleting any students", async () => {
+    const removeGroup = jest.fn();
+    jest.spyOn(Group, "findOne").mockResolvedValue({ _id: G, deleteOne: removeGroup } as any);
+    jest.spyOn(Student, "find").mockReturnValue(chain([{ _id: S }]));
+    jest.spyOn(AttendanceRecord, "exists").mockResolvedValue({ _id: G } as any);
+    jest.spyOn(StudentMembership, "exists").mockResolvedValue(null);
+    jest.spyOn(MonthlySubscription, "exists").mockResolvedValue(null);
+    jest.spyOn(ExamGrade, "exists").mockResolvedValue(null);
+    const { BookSale } = await import("../models/BookSale");
+    jest.spyOn(BookSale, "exists").mockResolvedValue(null);
+    const removeStudents = jest.spyOn(Student, "deleteMany");
+    const response = res();
+    await deleteGroup(req({ params: { id: G }, body: { deleteStudents: true } }), response);
+    expect(response.statusCode).toBe(409);
+    expect(removeGroup).not.toHaveBeenCalled();
+    expect(removeStudents).not.toHaveBeenCalled();
+  });
+  test("group-only staff cannot cascade-delete students", async () => {
+    jest.spyOn(Group, "findOne").mockResolvedValue({ _id: G } as any);
+    const lookup = jest.spyOn(Student, "find");
+    const response = res();
+    await deleteGroup(req({ user: { ...teacher, staff_permissions: ["groups"] }, params: { id: G }, body: { deleteStudents: true } }), response);
+    expect(response.statusCode).toBe(403);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+  test("family rename scopes the family document to its teacher", async () => {
+    jest.spyOn(Student, "updateMany").mockResolvedValue({ matchedCount: 0 } as any);
+    const update = jest.spyOn(SiblingFamily, "findOneAndUpdate").mockResolvedValue(null);
+    const response = res();
+    await renameFamiliy(req({ body: { familyId: B, familyName: "عائلة" } }), response);
+    expect(update).toHaveBeenCalledWith({ _id: B, teacher_id: A }, { family_name: "عائلة" });
+    expect(response.statusCode).toBe(404);
+  });
+  test("legacy family identifiers can be renamed through owned members", async () => {
+    jest.spyOn(Student, "updateMany").mockResolvedValue({ matchedCount: 1 } as any);
+    const update = jest.spyOn(SiblingFamily, "findOneAndUpdate");
+    const response = res();
+    await renameFamiliy(req({ body: { familyId: "FAM-legacy", familyName: "عائلة" } }), response);
+    expect(update).not.toHaveBeenCalled();
+    expect(response.statusCode).toBe(200);
+  });
   test.each([getTeacherById, updateTeacher])("limited admin cannot reach foreign teacher handler %p", async handler => {
     const lookup = jest.spyOn(Teacher, "findById");
     const response = res(); await handler(req({ user: admin, params: { id: B } }), response);
@@ -61,7 +118,7 @@ describe("tenant boundaries", () => {
   });
   test("foreign group rejected before modifying student", async () => {
     jest.spyOn(Student, "findOne").mockReturnValue(chain({ _id: S, teacher_id: A }));
-    jest.spyOn(Group, "exists").mockResolvedValue(null);
+    jest.spyOn(Group, "findOne").mockReturnValue(chain(null));
     const write = jest.spyOn(Student, "findOneAndUpdate"); const response = res();
     await updateStudent(req({ params: { id: S }, body: { group_id: G } }), response);
     expect(response.statusCode).toBe(403); expect(write).not.toHaveBeenCalled();

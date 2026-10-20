@@ -7,6 +7,7 @@ export interface IStudent extends Document {
   group_id: mongoose.Types.ObjectId | null;
   grade_id?: mongoose.Types.ObjectId | null;
   teacher_id: mongoose.Types.ObjectId;
+  /** Legacy display field. Payment status is authoritative in MonthlySubscription. */
   months?: boolean[];
   received_books?: string[];
   discount_value?: number;
@@ -27,6 +28,8 @@ export interface IStudent extends Document {
   subscription_start_year?: number | null;
   notes?: string | null;
   is_suspended?: boolean;
+  suspension_kind?: "manual" | "financial" | null;
+  suspension_threshold?: number | null;
   suspended_until?: Date | null;
   suspension_reason?: string | null;
   group_join_date?: string | null; // YYYY-MM-DD
@@ -63,6 +66,8 @@ const StudentSchema = new Schema<IStudent>(
     subscription_start_year: { type: Number, default: null },
     notes: { type: String, default: null },
     is_suspended: { type: Boolean, default: false },
+    suspension_kind: { type: String, enum: ["manual", "financial", null], default: null },
+    suspension_threshold: { type: Number, default: null },
     suspended_until: { type: Date, default: null },
     suspension_reason: { type: String, default: null },
     group_join_date: { type: String, default: null },

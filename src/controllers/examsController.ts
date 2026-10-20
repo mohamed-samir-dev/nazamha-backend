@@ -1,5 +1,6 @@
 import { atomicController, series } from "../services/atomicController";
 import { Response } from "express";
+import { Types } from "mongoose";
 import { AuthRequest } from "../middleware/auth";
 import { QuestionBank } from "../models/QuestionBank";
 import { Student } from "../models/Student";
@@ -99,6 +100,27 @@ export const getStudentExams = async (req: AuthRequest, res: Response): Promise<
 };
 
 // جلب كل درجات كل الطلاب للمعلم دفعة واحدة
+export const getExamReportSummary = async (req: AuthRequest, res: Response): Promise<void> => {
+  const teacherId = new Types.ObjectId(req.user!.id);
+  const rows = await Exam.aggregate([
+    { $match: { teacher_id: teacherId } },
+    { $sort: { exam_date: -1, created_at: -1, _id: -1 } },
+    { $lookup: { from: ExamGrade.collection.name, localField: "_id", foreignField: "exam_id", as: "grades" } },
+    { $unwind: "$grades" },
+    { $group: {
+      _id: "$grades.student_id", latest: { $first: "$$ROOT" },
+      average: { $avg: { $cond: [{ $and: [{ $ne: ["$grades.score", null] }, { $gt: ["$max_score", 0] }] }, { $multiply: [{ $divide: ["$grades.score", "$max_score"] }, 100] }, null] } },
+    } },
+    { $lookup: { from: "students", localField: "_id", foreignField: "_id", as: "student" } },
+    { $match: { "student.teacher_id": teacherId } },
+    { $project: { student: 0 } },
+  ]);
+  res.json(Object.fromEntries(rows.map(row => [String(row._id), {
+    average: row.average == null ? null : Math.round(row.average),
+    latest: { ...mapExam(row.latest), score: row.latest.grades.score },
+  }])));
+};
+
 export const getAllStudentsExamGrades = async (req: AuthRequest, res: Response): Promise<void> => {
   const exams = await Exam.find({ teacher_id: req.user!.id }).lean();
   if (exams.length === 0) { res.json({}); return; }

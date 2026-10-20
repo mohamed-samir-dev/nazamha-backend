@@ -43,6 +43,7 @@ MonthlySubscriptionSchema.index({ teacher_id: 1, month: 1, year: 1 });
 MonthlySubscriptionSchema.index({ teacher_id: 1, year: 1 });
 // batch query: teacher + multiple students
 MonthlySubscriptionSchema.index({ teacher_id: 1, student_id: 1 });
+MonthlySubscriptionSchema.index({ teacher_id: 1, student_id: 1, year: 1 });
 // auto-suspend query: teacher + status
 MonthlySubscriptionSchema.index({ teacher_id: 1, status: 1 });
 // financial report date-range query: teacher + status + paid_at

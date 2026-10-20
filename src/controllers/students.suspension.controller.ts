@@ -14,9 +14,12 @@ export const suspendStudent = async (req: AuthRequest, res: Response): Promise<v
     };
 
     const until = suspended_until ? new Date(suspended_until) : null;
+    if (until && (!Number.isFinite(until.getTime()) || until.getTime() <= Date.now())) {
+      res.status(400).json({ message: "يجب أن يكون تاريخ انتهاء الإيقاف في المستقبل" }); return;
+    }
     const student = await Student.findOneAndUpdate(
       { _id: req.params.id, ...teacherFilter(req) },
-      { is_suspended: true, suspended_until: until, suspension_reason: suspension_reason || null },
+      { is_suspended: true, suspension_kind: "manual", suspension_threshold: null, suspended_until: until, suspension_reason: suspension_reason || null },
       { new: true }
     );
     if (!student) { res.status(404).json({ message: "الطالب غير موجود" }); return; }

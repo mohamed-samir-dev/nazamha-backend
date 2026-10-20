@@ -46,6 +46,7 @@ export const updateGrade = async (req: AuthRequest, res: Response): Promise<void
 export const deleteGrade = async (req: AuthRequest, res: Response): Promise<void> => {
   const used = await Promise.all([Student, Group, Book, QuestionBank].map((model: any) => model.exists({ grade_id: req.params.id, ...teacherFilter(req) })));
   if (used.some(Boolean)) { res.status(409).json({ message: "الصف مستخدم؛ انقل السجلات المرتبطة قبل حذفه" }); return; }
-  await Grade.findOneAndDelete({ _id: req.params.id, ...teacherFilter(req) });
+  const deleted = await Grade.findOneAndDelete({ _id: req.params.id, ...teacherFilter(req) });
+  if (!deleted) { res.status(404).json({ message: "الصف غير موجود" }); return; }
   res.json({ message: "تم الحذف بنجاح" });
 };

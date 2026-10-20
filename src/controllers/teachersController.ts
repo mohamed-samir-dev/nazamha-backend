@@ -1,3 +1,4 @@
+import { atomicController, series } from "../services/atomicController";
 import { Response } from "express";
 import mongoose from "mongoose";
 import { Teacher, ITeacher } from "../models/Teacher";
@@ -32,7 +33,7 @@ export const changeMyPassword = async (req: AuthRequest, res: Response): Promise
   res.json({ message: "تم تغيير كلمة المرور بنجاح" });
 };
 
-export const updateMe = async (req: AuthRequest, res: Response): Promise<void> => {
+export const updateMe = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   // Strict whitelist — only these fields may be updated by the teacher themselves.
   // ALL subscription, billing, feature, and status fields are intentionally excluded.
   const ALLOWED_SELF_UPDATE_FIELDS: (keyof ITeacher)[] = [
@@ -49,16 +50,20 @@ export const updateMe = async (req: AuthRequest, res: Response): Promise<void> =
 
   const newMonths: number[] | undefined = (req.body as any)?.academic_year?.active_months;
   const newMonthYears: { month: number; year: number }[] | undefined = (req.body as any)?.academic_year?.active_month_years;
+  if ((newMonths !== undefined && (!Array.isArray(newMonths) || newMonths.some(month => !Number.isInteger(month) || month < 1 || month > 12))) ||
+      (newMonthYears !== undefined && (!Array.isArray(newMonthYears) || newMonthYears.some(period => !Number.isInteger(period.month) || period.month < 1 || period.month > 12 || !Number.isInteger(period.year) || period.year < 2000 || period.year > 2100)))) {
+    res.status(400).json({ message: "فترات السنة الدراسية غير صالحة" }); return;
+  }
 
-  const teacher = await Teacher.findByIdAndUpdate(req.user!.id, { $set: update }, { new: true });
+  const teacher = await Teacher.findByIdAndUpdate(req.user!.id, { $set: update }, { new: true, runValidators: true });
   if (!teacher) { res.status(404).json({ message: "المعلم غير موجود" }); return; }
 
   if (newMonths?.length || newMonthYears?.length) {
-    syncAllStudentsForTeacher(String(req.user!.id)).catch(console.error);
+    await syncAllStudentsForTeacher(String(req.user!.id));
   }
 
   res.json(teacher);
-};
+});
 
 const SENSITIVE_FIELDS = "-password -email_verification_token -refresh_token -last_login_ip";
 

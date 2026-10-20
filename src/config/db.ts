@@ -24,6 +24,11 @@ export const connectDB = async (): Promise<void> => {
     retryReads: true,
   });
   console.log(`✅ MongoDB connected: ${mongoose.connection.host}`);
+  const topology = await mongoose.connection.db!.admin().command({ hello: 1 });
+  if (!topology.setName && topology.msg !== "isdbgrid") {
+    await mongoose.disconnect();
+    throw new Error("MongoDB must run as a replica set or sharded cluster: student and financial writes require transactions.");
+  }
 
   mongoose.connection.on("error", (err) => {
     console.error("❌ MongoDB connection error:", err);

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getExamReportSummary } from "../controllers/examsController";
 import { protect } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
 import { getExams, createExam, updateExam, deleteExam, getGrades, upsertGrades, findOrCreateByBank, getStudentExams, getAllStudentsExamGrades } from "../controllers/examsController";
@@ -12,6 +13,7 @@ router.post("/find-or-create", asyncHandler(findOrCreateByBank));
 router.patch("/:id", asyncHandler(updateExam));
 router.delete("/:id", asyncHandler(deleteExam));
 router.get("/all-grades", asyncHandler(getAllStudentsExamGrades));
+router.get("/report-summary", asyncHandler(getExamReportSummary));
 router.get("/student/:studentId", asyncHandler(getStudentExams));
 router.get("/:examId/grades", asyncHandler(getGrades));
 router.post("/:examId/grades", asyncHandler(upsertGrades));

@@ -23,6 +23,9 @@ import { findScannedStudent } from "../src/utils/studentScan";
 import { getDashboard, getDashboardPayments } from "../src/controllers/dashboardController";
 import { deleteGroupsBulk } from "../src/controllers/groupsController";
 import { setFamilyDiscount } from "../src/controllers/students.discount.controller";
+import { Exam, ExamGrade } from "../src/models/Exam";
+import { getExamReportSummary } from "../src/controllers/examsController";
+import { bulkUpdateSubscriptions } from "../src/controllers/subscriptionsController";
 
 const uri = process.env.ARCHITECTURE_TEST_URI || "";
 if (!/^mongodb:\/\/127\.0\.0\.1:\d+\/architecture_test_[a-z0-9_]+(?:\?|$)/.test(uri)) throw new Error("An isolated localhost architecture_test_* database is required");
@@ -44,6 +47,10 @@ async function main() {
  assert.equal((await call(sellBook,request({...input,force_resell:true},"intentional-resale"))).code,201);
  assert.equal(await BookSale.countDocuments({student_id:student._id}),2);
  assert.equal((await call(sellBook,request({...input,force_resell:true},winner===0?"sale-a":"sale-b"))).code,409);
+ const duplicateRetry=await Promise.all([call(sellBook,request({...input,force_resell:true},"same-key-concurrent")),call(sellBook,request({...input,force_resell:true},"same-key-concurrent"))]);
+ assert.deepEqual(duplicateRetry.map(row=>row.code),[201,201]);
+ assert.equal(String(duplicateRetry[0].body.id),String(duplicateRetry[1].body.id));
+ assert.equal(await BookSale.countDocuments({student_id:student._id}),3);
  console.log("PASS concurrent sale, retry replay, payload conflict, intentional resale");
  const rollback=atomicController(async(_req,res)=>{await Student.updateOne({_id:student._id},{$set:{name:"Must roll back"}});res.status(422).json({message:"injected failure"});});
  assert.equal((await call(rollback,request({}))).code,422);assert.equal((await Student.findById(student._id))!.name,"Architecture QA");
@@ -84,6 +91,11 @@ async function main() {
  assert.equal((await Student.findById(student._id))!.family_discount_percent,25);
  assert.equal((await call(deleteGroupsBulk,request({ids:[String(groups[0]._id)]}))).code,409);
  console.log("PASS family discount rollback and bulk group history protection");
+ const invalidPayment=await call(bulkUpdateSubscriptions,{...request({updates:[{id:String(siblingSub!._id),status:"invalid"}]}),params:{studentId:bulk.body.students[0].id}});
+ assert.equal(invalidPayment.code,400);
+ const wrongStudent=await call(bulkUpdateSubscriptions,{...request({updates:[{id:String(siblingSub!._id),status:"paid"}]}),params:{studentId:String(student._id)}});
+ assert.equal(wrongStudent.code,404);assert.equal((await MonthlySubscription.findById(siblingSub!._id))!.status,"due");
+ console.log("PASS bulk payment status validation and student isolation");
  const loadStudents=await Student.insertMany(Array.from({length:250},(_,i)=>({name:"Load student "+i,teacher_id:teacher,group_id:groups[0]._id,grade_id:grade._id})));
  await MonthlySubscription.insertMany(loadStudents.map(s=>({student_id:s._id,teacher_id:teacher,month:10,year:2026,status:"due",amount:100})));
  const summary=await call(getDashboard,{...request({}),query:{summary:"1",month:"10",year:"2026",refresh:"1"}});
@@ -94,6 +106,13 @@ async function main() {
  const unpaid=await call(getDashboardPayments,{...request({}),query:{unpaid:"1",month:"10",year:"2026"}});
  assert.equal(unpaid.body.total,summary.body.totals.due);assert.ok(unpaid.body.students.length<=50);
  console.log("PASS compact dashboard totals and paginated unpaid list");
+ const exam1=await Exam.create({teacher_id:teacher,group_id:groups[0]._id,title:"First",max_score:50,exam_date:"2026-10-01"});
+ const exam2=await Exam.create({teacher_id:teacher,group_id:groups[1]._id,title:"Latest",max_score:100,exam_date:"2026-10-10"});
+ await ExamGrade.create([{exam_id:exam1._id,student_id:student._id,score:40},{exam_id:exam2._id,student_id:student._id,score:90}]);
+ const exams=await call(getExamReportSummary,request({}));
+ assert.equal(exams.body[String(student._id)].average,85);assert.equal(exams.body[String(student._id)].latest.title,"Latest");
+ const foreign=await call(getExamReportSummary,{...request({}),user:{id:String(new mongoose.Types.ObjectId()),user_type:"teacher"}});assert.deepEqual(foreign.body,{});
+ console.log("PASS exam summary average, latest exam, and teacher isolation");
  const fullBytes=Buffer.byteLength(JSON.stringify(full.body)), summaryBytes=Buffer.byteLength(JSON.stringify(summary.body));
  assert.ok(summaryBytes<fullBytes/5);
  console.log(JSON.stringify({dashboardStudents:summary.body.totals.totalStudents,fullBytes,summaryBytes,reductionPercent:Number((100*(1-summaryBytes/fullBytes)).toFixed(1))}));

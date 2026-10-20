@@ -7,10 +7,18 @@ async function start() {
   await connectDB();
   const stopAbsent = scheduleAutoAbsent();
   const stopRecurring = scheduleRecurringGeneration();
+  let stopping = false;
   const stop = async () => {
-    stopAbsent(); stopRecurring();
-    await disconnectDB();
-    process.exit(0);
+    if (stopping) return;
+    stopping = true;
+    try {
+      await Promise.all([stopAbsent(), stopRecurring()]);
+      await disconnectDB();
+      process.exit(0);
+    } catch (error) {
+      console.error("[worker] shutdown failed", error);
+      process.exit(1);
+    }
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);

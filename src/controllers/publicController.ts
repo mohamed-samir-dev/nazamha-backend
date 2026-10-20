@@ -7,68 +7,65 @@ import { AttendanceRecord } from "../models/AttendanceRecord";
 import { MonthlySubscription } from "../models/MonthlySubscription";
 import { Exam, ExamGrade } from "../models/Exam";
 import { SystemSettings } from "../models/SystemSettings";
+import { BookSale } from "../models/BookSale";
+import { StudentMembership } from "../models/StudentMembership";
+import { getTodayInTimezone } from "../utils/timezoneUtils";
 
 export const getPublicStudentReport = async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-
+  const today = getTodayInTimezone();
+  const [currentYear, currentMonth] = today.split("-").map(Number);
+  const month = req.query.month === undefined ? currentMonth : Number(req.query.month);
+  const year = req.query.year === undefined ? currentYear : Number(req.query.year);
+  if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year) || year < 2000 || year > 2100) {
+    res.status(400).json({ message: "الشهر أو السنة غير صحيح" }); return;
+  }
   const student = await Student.findById(id).lean() as any;
   if (!student) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
-
-  const now = new Date();
-  const month = now.getMonth() + 1;
-  const year = now.getFullYear();
-
-  const [
-    teacher,
-    attendanceRecords,
-    subscription,
-    settings,
-    grade,
-    group,
-    lastGrade,
-  ] = await Promise.all([
-    Teacher.findById(student.teacher_id).select("name").lean() as Promise<any>,
-    AttendanceRecord.find({ student_id: id, month, year }).lean() as Promise<any[]>,
-    MonthlySubscription.findOne({ student_id: id, month, year }).lean() as Promise<any>,
-    SystemSettings.findOne().lean() as Promise<any>,
-    student.grade_id
-      ? Grade.findById(student.grade_id).select("name").lean() as Promise<any>
-      : Promise.resolve(null),
-    student.group_id
-      ? Group.findById(student.group_id).select("name day_of_week time").lean() as Promise<any>
-      : Promise.resolve(null),
-    ExamGrade.findOne({ student_id: id })
-      .sort({ created_at: -1 })
-      .lean() as Promise<any>,
+  const prefix = `${year}-${String(month).padStart(2, "0")}`;
+  const start = `${prefix}-01`;
+  const end = `${prefix}-${new Date(year, month, 0).getDate()}`;
+  const scope = { student_id: id, teacher_id: student.teacher_id };
+  const [teacher, attendanceRecords, subscriptions, settings, grade, group, examGrades, books, memberships, lastAttendance] = await Promise.all([
+    Teacher.findById(student.teacher_id).select("name").lean(),
+    AttendanceRecord.find({ ...scope, month, year }).sort({ session_date: 1 }).populate("group_id", "name").lean(),
+    MonthlySubscription.find({ ...scope, $or: [{ year: { $lt: year } }, { year, month: { $lte: month } }] }).select("month year status amount discount paid_at receipt_number").sort({ year: -1, month: -1 }).lean(),
+    SystemSettings.findOne().select("site_name site_logo").lean(),
+    student.grade_id ? Grade.findById(student.grade_id).select("name").lean() : null,
+    student.group_id ? Group.findById(student.group_id).select("name day_of_week time").lean() : null,
+    ExamGrade.find({ student_id: id }).select("exam_id score").populate({ path: "exam_id", match: { teacher_id: student.teacher_id }, select: "title max_score exam_date created_at" }).lean(),
+    BookSale.find({ ...scope, month, year, status: "active" }).select("book_id price discount final_price is_exempt created_at").populate("book_id", "name").sort({ created_at: 1 }).lean(),
+    StudentMembership.find({ ...scope, starts_on: { $lte: end }, $or: [{ ends_on: null }, { ends_on: { $gte: start } }] }).populate("group_id", "name").sort({ starts_on: 1 }).lean(),
+    AttendanceRecord.findOne({ ...scope, status: "present", session_date: { $lte: end } }).sort({ session_date: -1 }).select("session_date").lean(),
   ]);
-
-  const lastExam = lastGrade
-    ? await Exam.findById(lastGrade.exam_id).lean() as any
-    : null;
-
-  const presentCount = (attendanceRecords as any[]).filter((r: any) => r.status === "present").length;
-  const absentCount = (attendanceRecords as any[]).filter((r: any) => r.status === "absent").length;
-  const isPaid = subscription?.status === "paid" || subscription?.status === "exempt";
-
+  const subscription = subscriptions.find(s => s.month === month && s.year === year);
+  const exams = examGrades.filter((row: any) => row.exam_id && row.exam_id.exam_date <= end).map((row: any) => ({ title: row.exam_id.title, date: row.exam_id.exam_date, score: row.score, max_score: row.exam_id.max_score })).sort((a, b) => b.date.localeCompare(a.date));
+  const monthlyExams = exams.filter(e => e.date.startsWith(prefix));
+  const average = (rows: typeof exams) => { const valid = rows.filter(e => e.score != null && e.max_score > 0); return valid.length ? Math.round(valid.reduce((sum, e) => sum + e.score / e.max_score * 100, 0) / valid.length) : null; };
+  const arrears = subscriptions.filter(s => s.status === "due");
+  const net = (s: { amount: number; discount?: number }) => Math.max(0, s.amount - (s.discount || 0));
+  const lastPaid = subscriptions.find(s => s.status === "paid");
+  const lastExam = exams[0];
+  const present = attendanceRecords.filter(r => r.status === "present").length;
+  const absent = attendanceRecords.filter(r => r.status === "absent").length;
   res.json({
-    id: student._id,
-    name: student.name,
-    code: student.code,
-    grade_name: grade?.name || "",
-    group_name: group?.name || "",
-    group_day: group?.day_of_week || "",
-    group_time: group?.time || "",
-    teacher_name: teacher?.name || "",
-    site_name: settings?.site_name || "نظمها",
-    site_logo: settings?.site_logo || "",
-    isPaid,
-    attendance_present: presentCount,
-    attendance_absent: absentCount,
-    attendance_total: presentCount + absentCount,
-    last_exam_title: lastExam?.title,
-    last_exam_score: lastGrade?.score ?? null,
-    last_exam_max: lastExam?.max_score,
-    last_exam_date: lastExam?.exam_date,
+    id: student._id, name: student.name, code: student.center_student_code || student.code,
+    grade_name: grade?.name || "", group_name: group?.name || "", group_day: group?.day_of_week || "", group_time: group?.time || "",
+    teacher_name: teacher?.name || "", site_name: settings?.site_name || "نظمها", site_logo: settings?.site_logo || "",
+    report_month: month, report_year: year, joined_at: student.created_at,
+    subscription_start_month: student.subscription_start_month, subscription_start_year: student.subscription_start_year,
+    isPaid: subscription?.status === "paid" || subscription?.status === "exempt", payment_status: subscription?.status || "missing",
+    subscription_amount: subscription ? net(subscription) : null, subscription_base: subscription?.amount ?? null, subscription_discount: subscription?.discount ?? 0,
+    paid_at: subscription?.paid_at || null, receipt_number: subscription?.receipt_number || null,
+    arrears_count: arrears.length, arrears_amount: arrears.reduce((sum, s) => sum + net(s), 0),
+    last_paid: lastPaid ? { month: lastPaid.month, year: lastPaid.year, amount: net(lastPaid) } : null,
+    attendance_present: present, attendance_absent: absent, attendance_total: present + absent,
+    last_attendance: lastAttendance?.session_date || null,
+    attendance: attendanceRecords.map((r: any) => ({ date: r.session_date, status: r.status, group: r.group_id?.name || "غير مسجلة" })),
+    exams: monthlyExams, exam_average: average(monthlyExams), exam_average_all_time: average(exams),
+    last_exam_title: lastExam?.title, last_exam_score: lastExam?.score ?? null, last_exam_max: lastExam?.max_score, last_exam_date: lastExam?.date,
+    books: books.map((b: any) => ({ name: b.book_id?.name || "كتاب سابق", price: b.price, discount: b.discount, amount: b.final_price, exempt: b.is_exempt, date: b.created_at })),
+    memberships: memberships.map((m: any) => ({ group: m.group_id?.name || "مجموعة سابقة", start: m.starts_on, end: m.ends_on })),
   });
 };
 

@@ -40,6 +40,7 @@ export const setFamilyDiscount = atomicController(async (req: AuthRequest, res: 
     const familyStudents = await Student.find({ teacher_id: teacherId, sibling_family_id: familyId })
       .select("_id custom_monthly_price group_id discount_value")
       .lean();
+      if (!familyStudents.length) { res.status(404).json({ message: "لا يوجد طلاب في هذه العائلة لتطبيق الخصم" }); return; }
 
     if (familyStudents.length > 0) {
       const groupIds = [...new Set(familyStudents.map((s: any) => s.group_id).filter(Boolean).map(String))];

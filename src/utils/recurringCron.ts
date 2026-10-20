@@ -1,4 +1,5 @@
 import { withJobLease } from "../services/jobLease";
+import { schedulePeriodicTask } from "../services/periodicTask";
 import { getTodayInTimezone } from "./timezoneUtils";
 /**
  * Recurring Salaries & Expenses Cron
@@ -137,9 +138,6 @@ export function scheduleRecurringGeneration() {
     }
   };
 
-  // Run immediately on startup (catches missed months)
-  run();
-  // Then every hour — lightweight since it uses exists() checks
-  const timer = setInterval(run, 60 * 60 * 1000);
-  return () => clearInterval(timer);
+  return schedulePeriodicTask(run, 60 * 60 * 1000,
+    error => console.error("[cron:recurring] scheduler error:", error));
 }

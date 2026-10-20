@@ -1,8 +1,10 @@
+import { atomicController, series } from "../services/atomicController";
 import { Response } from "express";
 import { Student } from "../models/Student";
 import { SiblingFamily } from "../models/SiblingFamily";
 import { AuthRequest } from "../middleware/auth";
 import { resolveBasePrice, syncDueSubscriptions } from "./students.helpers";
+import mongoose from "mongoose";
 
 export const createFamily = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -97,17 +99,17 @@ export const getSiblings = async (req: AuthRequest, res: Response): Promise<void
 
     // دمج العائلات المنشأة مع الطلاب
     const familyIdSet = new Set(familyDocs.map((f) => String(f._id)));
-    const families: { familyId: string; familyName: string; members: typeof students }[] = [];
+    const families: { familyId: string; familyName: string; parentPhone?: string | null; members: typeof students }[] = [];
 
     // أولاً: العائلات المنشأة من الـ collection
     for (const doc of familyDocs) {
       const fid = String(doc._id);
-      families.push({ familyId: fid, familyName: doc.family_name, members: studentMap[fid] ?? [] });
+      families.push({ familyId: fid, familyName: doc.family_name, parentPhone: doc.parent_phone, members: studentMap[fid] ?? [] });
     }
 
     // ثانياً: العائلات القديمة (FAM_xxx) اللي مش في الـ collection
     for (const [fid, members] of Object.entries(studentMap)) {
-      if (!familyIdSet.has(fid) && members.length >= 2) {
+      if (!familyIdSet.has(fid) && members.length >= 1) {
         const anyName = members.find((m) => m.sibling_family_name)?.sibling_family_name;
         families.push({ familyId: fid, familyName: anyName || `عائلة`, members });
       }
@@ -119,7 +121,7 @@ export const getSiblings = async (req: AuthRequest, res: Response): Promise<void
   }
 };
 
-export const linkSiblings = async (req: AuthRequest, res: Response): Promise<void> => {
+export const linkSiblings = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const teacherId = req.user!.id;
     const { studentIds, familyName } = req.body as { studentIds: string[]; familyName?: string };
@@ -141,7 +143,7 @@ export const linkSiblings = async (req: AuthRequest, res: Response): Promise<voi
       `FAM_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
     // جلب اسم العائلة من الـ collection لو موجود
-    const familyDoc = await SiblingFamily.findOne({ _id: existingFamilyId, teacher_id: teacherId }).lean().catch(() => null);
+    const familyDoc = mongoose.isObjectIdOrHexString(existingFamilyId) ? await SiblingFamily.findOne({ _id: existingFamilyId, teacher_id: teacherId }).lean() : null;
     const autoName = familyName || familyDoc?.family_name || (() => {
       const parts = students[0]?.name?.trim().split(/\s+/) || [];
       return `عائلة ${parts[1] || parts[0] || ""}`;
@@ -179,31 +181,39 @@ export const linkSiblings = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     res.json({ message: "تم الربط بنجاح", familyId: existingFamilyId, familyName: autoName });
-  } catch {
+  } catch (error: any) {
+    if(error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء ربط الإخوة" });
   }
-};
+});
 
-export const renameFamiliy = async (req: AuthRequest, res: Response): Promise<void> => {
+export const renameFamiliy = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const teacherId = req.user!.id;
     const { familyId, familyName } = req.body as { familyId: string; familyName: string };
     if (!familyId || !familyName?.trim()) { res.status(400).json({ message: "البيانات ناقصة" }); return; }
 
-    await Promise.all([
+    const [studentsResult, family] = await series([
       Student.updateMany(
         { teacher_id: teacherId, sibling_family_id: familyId },
         { sibling_family_name: familyName.trim() }
       ),
-      SiblingFamily.findByIdAndUpdate(familyId, { family_name: familyName.trim() }).catch(() => {}),
+      mongoose.isObjectIdOrHexString(familyId)
+        ? SiblingFamily.findOneAndUpdate({ _id: familyId, teacher_id: teacherId }, { family_name: familyName.trim() })
+        : Promise.resolve(null),
     ]);
+    if (!studentsResult.matchedCount && !family) {
+      res.status(404).json({ message: "العائلة غير موجودة" });
+      return;
+    }
     res.json({ message: "تم تحديث اسم العائلة" });
-  } catch {
+  } catch (error: any) {
+    if(error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء تحديث اسم العائلة" });
   }
-};
+});
 
-export const transferFamily = async (req: AuthRequest, res: Response): Promise<void> => {
+export const transferFamily = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const teacherId = req.user!.id;
     const { studentId, targetFamilyId } = req.body as { studentId: string; targetFamilyId: string };
@@ -219,7 +229,7 @@ export const transferFamily = async (req: AuthRequest, res: Response): Promise<v
       sibling_family_id: targetFamilyId,
     }).lean();
 
-    const targetFamily = targetMember ? null : await SiblingFamily.findOne({ _id: targetFamilyId, teacher_id: teacherId }).lean().catch(() => null);
+    const targetFamily = targetMember || !mongoose.isObjectIdOrHexString(targetFamilyId) ? null : await SiblingFamily.findOne({ _id: targetFamilyId, teacher_id: teacherId }).lean();
     if (!targetMember && !targetFamily) { res.status(404).json({ message: "العائلة المطلوبة غير موجودة" }); return; }
     const targetFamilyName = (targetMember as any)?.sibling_family_name || targetFamily?.family_name || null;
     const newFamilyPct = (targetMember as any)?.family_discount_percent ?? null;
@@ -274,12 +284,13 @@ export const transferFamily = async (req: AuthRequest, res: Response): Promise<v
     await syncDueSubscriptions(studentId, teacherId, basePrice, newFamilyPct, (student as any).discount_value);
 
     res.json({ message: "تم النقل بنجاح", familyId: targetFamilyId, familyName: targetFamilyName });
-  } catch {
+  } catch (error: any) {
+    if(error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء نقل الطالب" });
   }
-};
+});
 
-export const deleteFamily = async (req: AuthRequest, res: Response): Promise<void> => {
+export const deleteFamily = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const teacherId = req.user!.id;
     const { familyId } = req.params;
@@ -299,7 +310,7 @@ export const deleteFamily = async (req: AuthRequest, res: Response): Promise<voi
       }
     );
 
-    await SiblingFamily.findOneAndDelete({ _id: familyId, teacher_id: teacherId }).catch(() => {});
+    if (mongoose.isObjectIdOrHexString(familyId)) await SiblingFamily.findOneAndDelete({ _id: familyId, teacher_id: teacherId });
 
     // sync اشتراكات كل الأعضاء بدون خصم عائلي
     for (const member of members) {
@@ -308,12 +319,13 @@ export const deleteFamily = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     res.json({ message: "تم حذف العائلة" });
-  } catch {
+  } catch (error: any) {
+    if(error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء حذف العائلة" });
   }
-};
+});
 
-export const unlinkSibling = async (req: AuthRequest, res: Response): Promise<void> => {
+export const unlinkSibling = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const teacherId = req.user!.id;
     const { studentId } = req.body as { studentId: string };
@@ -363,7 +375,8 @@ export const unlinkSibling = async (req: AuthRequest, res: Response): Promise<vo
     }
 
     res.json({ message: "تم فصل الطالب عن العائلة" });
-  } catch {
+  } catch (error: any) {
+    if(error?.hasErrorLabel?.("TransientTransactionError")) throw error;
     res.status(500).json({ message: "حدث خطأ أثناء فصل الطالب" });
   }
-};
+});

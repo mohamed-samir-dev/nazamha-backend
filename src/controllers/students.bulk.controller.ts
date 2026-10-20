@@ -10,7 +10,8 @@ import { Teacher } from "../models/Teacher";
 import { Group } from "../models/Group";
 import { MonthlySubscription } from "../models/MonthlySubscription";
 import { AuthRequest, canAccessTeacher } from "../middleware/auth";
-import { calcDiscount, allocateStudentCode, resolveOrCreateCenterStudent, normalizeName, normalizePhone } from "./students.helpers";
+import { calcDiscount, allocateStudentCodes, resolveOrCreateCenterStudent, normalizeName, normalizePhone } from "./students.helpers";
+import { validStudentName } from "../utils/studentName";
 
 interface BulkStudentInput {
   name: string;
@@ -55,7 +56,7 @@ export const bulkAddStudents = atomicController(async (req: AuthRequest, res: Re
 
   for (const student of students) {
     if (!validStudentDiscounts(student as unknown as Record<string, unknown>)) { res.status(400).json({ message: "نسبة الخصم يجب أن تكون رقمًا بين 0 و100" }); return; }
-    if (typeof student.name !== "string" || !student.name.trim()) { res.status(400).json({ message: "طالب أو مجموعة أو مرحلة غير صالحة" }); return; }
+    if (!validStudentName(student.name)) { res.status(400).json({ message: "اسم كل طالب يجب أن يكون حروفًا واسمين على الأقل" }); return; }
   }
   // ── 1. جيب Teacher + Groups بـ query واحد لكل منهم ──────────────────────
   const teacher = await Teacher.findById(teacherId).lean();
@@ -128,6 +129,13 @@ export const bulkAddStudents = atomicController(async (req: AuthRequest, res: Re
   const now = new Date();
   const [currentYear, currentMonth] = getTodayInTimezone().split("-").map(Number);
   const docsToInsert: object[] = [];
+  const reservedCodes = new Map<string, string[]>();
+  const requestedCounts = new Map<string, number>();
+  for (const student of students) if (student.group_id) requestedCounts.set(student.group_id, (requestedCounts.get(student.group_id) || 0) + 1);
+  for (const [groupId, count] of requestedCounts) {
+    const prefix = groupMap.get(groupId)?.code;
+    if (prefix) reservedCodes.set(groupId, await allocateStudentCodes(teacherId, groupId, prefix, count));
+  }
 
 
   for (const s of students) {
@@ -151,7 +159,7 @@ export const bulkAddStudents = atomicController(async (req: AuthRequest, res: Re
       const g = groupMap.get(s.group_id);
       const groupCode = (g as any)?.code;
       if (groupCode) {
-        code = await allocateStudentCode(teacherId, s.group_id, groupCode);
+        code = reservedCodes.get(s.group_id)!.shift();
       }
     }
 

@@ -626,6 +626,11 @@ export const getStudentBookCounts = async (req: AuthRequest, res: Response): Pro
   } else if (!req.user!.is_admin) {
     matchFilter.teacher_id = new mongoose.Types.ObjectId(req.user!.id);
   }
+  if (req.query.student_ids !== undefined) {
+    const ids = String(req.query.student_ids).split(",").filter(Boolean);
+    if (ids.length > 500 || ids.some(id => !mongoose.isValidObjectId(id))) { res.status(400).json({ message: "قائمة الطلاب غير صحيحة" }); return; }
+    matchFilter.student_id = { $in: ids.map(id => new mongoose.Types.ObjectId(id)) };
+  }
   const agg = await BookSale.aggregate([
     { $match: matchFilter },
     { $group: { _id: "$student_id", bookIds: { $addToSet: "$book_id" } } },

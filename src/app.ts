@@ -26,7 +26,7 @@ process.on("uncaughtException", (err: Error) => {
 
 import { csrfProtection, csrfTokenHandler } from "./middleware/csrf";
 import { connectDB, disconnectDB } from "./config/db";
-import { connectRedis } from "./config/redis";
+import { connectRedis, getRedisClient } from "./config/redis";
 import { scheduleAutoAbsent } from "./workers/autoAbsent";
 import mongoose from "mongoose";
 import { scheduleRecurringGeneration } from "./utils/recurringCron";
@@ -112,7 +112,12 @@ app.use("/api/exams", examsRoutes);
 app.use("/api/public", publicRoutes);
 app.use("/api/centers", centersRoutes);
 
-app.get("/api/ready", (_req, res) => { const ready = mongoose.connection.readyState === 1; res.status(ready ? 200 : 503).json({ ready }); });
+app.get("/api/ready", async (_req, res) => {
+  const database = mongoose.connection.readyState === 1;
+  const sharedCounters = !process.env.REDIS_URL || (await getRedisClient())?.status === "ready";
+  const ready = database && sharedCounters;
+  res.status(ready ? 200 : 503).json({ ready, database, sharedCounters });
+});
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 
 // Error handling
@@ -142,13 +147,22 @@ connectDB()
     const stopAbsent = process.env.RUN_WORKERS !== "false" ? scheduleAutoAbsent() : () => {};
     const stopRecurring = process.env.RUN_WORKERS !== "false" ? scheduleRecurringGeneration() : () => {};
 
+    let stopping = false;
     const shutdown = async (signal: string) => {
+      if (stopping) return;
+      stopping = true;
       console.log(`[${signal}] Shutting down gracefully...`);
-      stopAbsent(); stopRecurring();
-      server.close(async () => {
+      try {
+        await Promise.all([
+          stopAbsent(), stopRecurring(),
+          new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
+        ]);
         await disconnectDB();
         process.exit(0);
-      });
+      } catch (error) {
+        console.error("[shutdown] failed", error);
+        process.exit(1);
+      }
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGINT", () => shutdown("SIGINT"));
