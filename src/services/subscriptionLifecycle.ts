@@ -4,6 +4,7 @@ import { MonthlySubscription, SubscriptionStatus } from "../models/MonthlySubscr
 import { Student } from "../models/Student";
 import { Teacher } from "../models/Teacher";
 import { Group } from "../models/Group";
+import { studentSubscriptionDiscount } from "../utils/studentSubscriptionDiscount";
 
 function resolveMonthYearsFromPairs(
   pairs: { month: number; year: number }[],
@@ -112,7 +113,7 @@ export async function generateSubscriptionsForStudent(
     student_id: studentId,
     month: { $in: resolved.map((r) => r.month) },
     year: { $in: years },
-  }).setOptions(session ? { session } : {}).lean().select("month year status amount");
+  }).setOptions(session ? { session } : {}).lean().select("month year status amount discount");
 
   const existingMap = new Map(
     existingDocs.map((e) => [`${e.month}-${e.year}`, e])
@@ -127,6 +128,7 @@ export async function generateSubscriptionsForStudent(
     } else if (existing.status === "due" || existing.status === "not_due") {
       const update: Record<string, unknown> = { status };
       if (existing.amount === 0 && amount > 0) { update.amount = amount; update.discount = discount; }
+      else if (student) { update.discount = studentSubscriptionDiscount(existing.amount, student); }
       ops.push({ updateOne: { filter: { student_id: studentId, month: m, year: subYear, status: { $in: ["due", "not_due"] } }, update: { $set: update } } });
     }
   }
@@ -256,14 +258,14 @@ export async function syncAllStudentsForTeacher(teacherId: string): Promise<numb
   const existingSubsRaw = await MonthlySubscription.find({
     teacher_id: teacherId,
     student_id: { $in: studentIds },
-  }).lean().select("student_id month year status amount");
+  }).lean().select("student_id month year status amount discount");
 
   // تجميع الاشتراكات الموجودة per student
-  const existingByStudent = new Map<string, Map<string, { status: string; amount: number }>>();
+  const existingByStudent = new Map<string, Map<string, { status: string; amount: number; discount: number }>>();
   for (const sub of existingSubsRaw) {
     const sid = String(sub.student_id);
     if (!existingByStudent.has(sid)) existingByStudent.set(sid, new Map());
-    existingByStudent.get(sid)!.set(`${sub.month}-${sub.year}`, { status: sub.status as string, amount: sub.amount });
+    existingByStudent.get(sid)!.set(`${sub.month}-${sub.year}`, { status: sub.status as string, amount: sub.amount, discount: sub.discount });
   }
 
   // ── 5. بناء كل الـ ops في حلقة واحدة ────────────────────────────────────
@@ -308,8 +310,12 @@ export async function syncAllStudentsForTeacher(teacherId: string): Promise<numb
       const existing = studentExisting.get(key);
       if (!existing) {
         ops.push({ insertOne: { document: { student_id: sid, teacher_id: teacherId, month: m, year: y, status: "due", amount: basePrice, discount } } });
-      } else if ((existing.status === "due" || existing.status === "not_due") && existing.amount === 0 && basePrice > 0) {
-        ops.push({ updateOne: { filter: { student_id: sid, month: m, year: y }, update: { $set: { amount: basePrice, discount } } } });
+      } else if (existing.status === "due" || existing.status === "not_due") {
+        const fillPrice = existing.amount === 0 && basePrice > 0;
+        const currentDiscount = fillPrice ? discount : studentSubscriptionDiscount(existing.amount, s);
+        if (fillPrice || currentDiscount !== existing.discount) {
+          ops.push({ updateOne: { filter: { student_id: sid, teacher_id: teacherId, month: m, year: y, status: {$in: ["due", "not_due"]} }, update: { $set: { ...(fillPrice ? {amount: basePrice} : {}), discount: currentDiscount } } } });
+        }
       }
     }
   }

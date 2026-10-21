@@ -6,6 +6,7 @@ import { Student } from "../models/Student";
 import { CenterStudent } from "../models/CenterStudent";
 import { MonthlySubscription } from "../models/MonthlySubscription";
 import mongoose from "mongoose";
+import { studentSubscriptionDiscount } from "../utils/studentSubscriptionDiscount";
 
 /** حساب كود الطالب بناءً على كودات المجموعة الموجودة */
 export function buildStudentCode(groupCode: string, existingCodes: string[]): string {
@@ -241,12 +242,7 @@ export function calcDiscount(
   familyPct: number | null | undefined,
   individualPct: number | null | undefined
 ): { amount: number; discount: number } {
-  const family = familyPct ?? 0;
-  const individual = Number(individualPct) || 0;
-  const activePct = family > 0 ? family : individual;
-  if (activePct <= 0) return { amount: basePrice, discount: 0 };
-  const netPrice = Math.round(basePrice * (1 - activePct / 100));
-  return { amount: basePrice, discount: basePrice - netPrice };
+  return {amount: basePrice, discount: studentSubscriptionDiscount(basePrice, {family_discount_percent: familyPct, discount_value: individualPct})};
 }
 
 /** مزامنة مبالغ الاشتراكات المستحقة لطالب واحد */

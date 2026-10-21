@@ -11,6 +11,14 @@ import { Teacher } from "../models/Teacher";
 import { Group } from "../models/Group";
 import { AuthRequest, teacherFilter } from "../middleware/auth";
 import { invalidateDashboardCache } from "./dashboardController";
+import { calcDiscount, resolveBasePrice } from "./students.helpers";
+
+async function currentStudentSubscriptionPrice(studentId: string, teacherId: string) {
+  const student = await Student.findOne({ _id: studentId, teacher_id: teacherId }).lean();
+  if (!student) return null;
+  const base = await resolveBasePrice(student.custom_monthly_price, student.group_id, teacherId);
+  return calcDiscount(base, student.family_discount_percent, student.discount_value);
+}
 
 // استخدم teacherFilter المركزي لضمان توحيد Authorization عبر teacher/admin/center/staff
 function subTeacherFilter(req: AuthRequest): Record<string, unknown> {
@@ -128,6 +136,16 @@ export const updateSubscription = atomicController(async (req: AuthRequest, res:
     res.status(400).json({ message: "لا توجد حقول للتحديث" }); return;
   }
 
+  // A reopened unpaid month must use the current family/individual discount.
+  // Paid and exempt records keep their historical financial values.
+  if (updates.status === "due") {
+    const existing = await MonthlySubscription.findOne({ _id: id, ...subTeacherFilter(req) }).lean();
+    if (!existing) { res.status(404).json({ message: "الاشتراك غير موجود" }); return; }
+    const price = await currentStudentSubscriptionPrice(String(existing.student_id), String(existing.teacher_id));
+    if (!price) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
+    Object.assign(updates, price);
+  }
+
   const sub = await MonthlySubscription.findOneAndUpdate(
     { _id: id, ...subTeacherFilter(req) },
     updates.status === "paid" ? [{ $set: { ...Object.fromEntries(Object.entries(updates).map(([field, value]) => [field, { $literal: value }])), paid_at: { $cond: [{ $eq: ["$status", "paid"] }, { $ifNull: ["$paid_at", new Date()] }, new Date()] } } }] : { $set: updates },
@@ -163,6 +181,14 @@ export const bulkUpdateSubscriptions = atomicController(async (req: AuthRequest,
   const ownedCount = await MonthlySubscription.countDocuments({ _id: { $in: updates.map(update => update.id) }, student_id: studentId, ...filter });
   if (ownedCount !== updates.length) { res.status(404).json({ message: "بعض الاشتراكات لا تخص هذا الطالب" }); return; }
 
+  let duePrice: {amount: number; discount: number} | null = null;
+  if (updates.some(update => update.status === "due")) {
+    const student = await Student.findOne({ _id: studentId, ...filter }).lean();
+    if (!student) { res.status(404).json({ message: "الطالب غير موجود" }); return; }
+    const base = await resolveBasePrice(student.custom_monthly_price, student.group_id, String(student.teacher_id));
+    duePrice = calcDiscount(base, student.family_discount_percent, student.discount_value);
+  }
+
   // Build a single bulkWrite instead of N concurrent findOneAndUpdate calls.
   // This reduces N round-trips to 1 while preserving all authorization checks
   // (teacher_id filter is embedded in each updateOne filter).
@@ -170,6 +196,7 @@ export const bulkUpdateSubscriptions = atomicController(async (req: AuthRequest,
     const extra: Record<string, unknown> = {};
     if (status === "paid") extra.paid_at = now;
     else extra.paid_at = null;
+    if (status === "due" && duePrice) Object.assign(extra, duePrice);
     return {
       updateOne: {
         filter: { _id: id, student_id: studentId, ...filter } as Record<string, unknown>,
