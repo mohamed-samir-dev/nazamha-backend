@@ -1,7 +1,9 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { studentCardToken } from "../utils/studentCard";
 
 export interface IStudent extends Document {
   mutation_version?: number;
+  card_qr_version?: number;
   name: string;
   code?: string;
   group_id: mongoose.Types.ObjectId | null;
@@ -41,6 +43,7 @@ export interface IStudent extends Document {
 const StudentSchema = new Schema<IStudent>(
   {
     mutation_version: { type: Number, default: 0 },
+    card_qr_version: { type: Number, default: 0 },
     name: { type: String, required: true, trim: true },
     code: { type: String },
     group_id: { type: Schema.Types.ObjectId, ref: "Group", default: null },
@@ -83,6 +86,7 @@ const StudentSchema = new Schema<IStudent>(
   }
 );
 
+StudentSchema.virtual("card_qr_token").get(function () { return studentCardToken(this); });
 StudentSchema.index({ teacher_id: 1, code: 1 });
 StudentSchema.index({ teacher_id: 1, grade_id: 1 });
 StudentSchema.index({ teacher_id: 1, group_id: 1 });

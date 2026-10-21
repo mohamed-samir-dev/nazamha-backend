@@ -76,6 +76,8 @@ export const revokeShareToken = async (req: AuthRequest, res: Response): Promise
   }
 
   const teacherId = resolveTeacherId(req);
+  // Revoke the permanent parent-read capability as well as temporary links.
+  await Student.updateOne({ _id: id, ...teacherFilter(req) }, { $inc: { card_qr_version: 1 } });
   await StudentShareToken.deleteMany({ student_id: id });
 
   res.json({ message: "تم إلغاء رابط المشاركة" });

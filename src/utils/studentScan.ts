@@ -8,7 +8,7 @@ export async function findScannedStudent(scope: Record<string, unknown>, input: 
   }
   if (typeof input.student_code !== "string") return null;
   const raw = input.student_code.trim();
-  const centerMatch = raw.match(/\/report\/c\/([^/?#]+)/);
+  const centerMatch = raw.match(/\/report\/c\/([^/?#]+)/) || (raw.match(/\/report\/([^/?#]+)/) && raw.match(/[?&]identity=([^&#]+)/));
   const studentMatch = centerMatch ? null : raw.match(/\/report\/([^/?#]+)/);
   let value = centerMatch?.[1] || studentMatch?.[1] || raw;
   try { value = decodeURIComponent(value); } catch { return null; }

@@ -17,6 +17,7 @@ import { getTodayInTimezone } from "../utils/timezoneUtils";
 
 import mongoose from "mongoose";
 import { validStudentName } from "../utils/studentName";
+import { studentCardToken } from "../utils/studentCard";
 
 // الحقول المسموح للـ client بتعديلها فقط
 const STUDENT_UPDATABLE_FIELDS = new Set([
@@ -51,11 +52,12 @@ const LISTING_FIELDS = [
   "received_books", "subscription_start_month", "subscription_start_year",
   "group_join_date", "created_at",
   "teacher_id",
+  "card_qr_version",
 ].join(" ");
 
 export const getStudents = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const fields = typeof req.query.fields === "string" ? req.query.fields.replace(/,/g, " ") : undefined;
+    const fields = typeof req.query.fields === "string" ? `${req.query.fields.replace(/,/g, " ")} teacher_id card_qr_version` : undefined;
     const pageParam = req.query.page;
     const limitParam = req.query.limit;
 
@@ -73,6 +75,7 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
           group_id: group_id ? String(group_id) : null,
           grade_id: grade_id ? String(grade_id) : null,
           ...rest,
+          card_qr_token: studentCardToken(s),
         };
       }));
       return;
@@ -123,6 +126,7 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
         group_id: group_id ? String(group_id) : null,
         grade_id: grade_id ? String(grade_id) : null,
         ...rest,
+        card_qr_token: studentCardToken(s),
       };
     });
 

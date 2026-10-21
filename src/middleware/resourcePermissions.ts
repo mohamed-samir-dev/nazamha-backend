@@ -69,7 +69,7 @@ export function enforceResourcePermissions(req: AuthRequest, res: Response, next
       if (Array.isArray(value)) return value.map(redact);
       const plain = typeof value.toJSON === "function" ? value.toJSON() : value;
       if (typeof plain !== "object" || plain === null) return plain;
-      return Object.fromEntries(Object.entries(plain).filter(([key]) => !/price|discount|^months$|received_books|financial_permissions|subscription_price|subscription_expires_at/.test(key)).map(([key, item]) => [key, redact(item)]));
+      return Object.fromEntries(Object.entries(plain).filter(([key]) => !/price|discount|^months$|received_books|financial_permissions|subscription_price|subscription_expires_at|^card_qr_/.test(key)).map(([key, item]) => [key, redact(item)]));
     };
     res.json = body => json(redact(body));
   }

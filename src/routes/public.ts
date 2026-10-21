@@ -6,6 +6,8 @@ import { getPublicStudentReport, getPublicCenterStudentReport } from "../control
 import { asyncHandler } from "../middleware/asyncHandler";
 import { CenterStudent } from "../models/CenterStudent";
 import { StudentShareToken } from "../models/StudentShareToken";
+import { Student } from "../models/Student";
+import { validStudentCard } from "../utils/studentCard";
 
 const router = Router();
 
@@ -24,11 +26,23 @@ const publicReportLimiter = rateLimit({
 // allowing access to the public student report.
 // This replaces the previous zero-auth endpoint (C4 — Critical fix).
 
-async function validateShareToken(
+export async function validateShareToken(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
+  res.set("Cache-Control", "no-store");
+  res.set("Referrer-Policy", "no-referrer");
+  if (req.query.card !== undefined) {
+    const id = req.params.id;
+    const card = req.query.card;
+    if (typeof id !== "string" || !/^[a-f0-9]{24}$/i.test(id) || typeof card !== "string" || !/^[a-f0-9]{64}$/.test(card)) {
+      res.status(401).json({ message: "كارت الطالب غير صالح" }); return;
+    }
+    const student = await Student.findOne({ _id: id }).select("teacher_id card_qr_version").lean();
+    if (!student || !validStudentCard(student, card)) { res.status(401).json({ message: "كارت الطالب غير صالح أو تم إلغاؤه" }); return; }
+    next(); return;
+  }
   const rawToken = req.query.token as string | undefined;
 
   if (typeof rawToken !== "string" || !/^[a-f0-9]{64}$/.test(rawToken)) {

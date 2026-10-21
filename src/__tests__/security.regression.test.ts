@@ -222,8 +222,10 @@ describe("session lifecycle and sharing", () => {
   test("revocation covers tokens created by other authorized actors", async () => {
     jest.spyOn(Student, "findOne").mockReturnValue(chain({ _id: S, teacher_id: A }));
     const remove = jest.spyOn(StudentShareToken, "deleteMany").mockResolvedValue({ deletedCount: 2 } as any);
+    const rotate = jest.spyOn(Student, "updateOne").mockResolvedValue({ modifiedCount: 1 } as any);
     await revokeShareToken(req({ params: { id: S } }), res());
     expect(remove).toHaveBeenCalledWith({ student_id: S });
+    expect(rotate).toHaveBeenCalledWith({ _id: S, teacher_id: A }, { $inc: { card_qr_version: 1 } });
   });
 });
 describe("attendance input validation", () => {
