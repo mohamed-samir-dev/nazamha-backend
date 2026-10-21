@@ -594,11 +594,19 @@ export const getStudentBooks = async (req: AuthRequest, res: Response): Promise<
   const bookFilter: Record<string, unknown> = { ...filter, status: "available" };
   if (studentGradeId) bookFilter.grade_id = studentGradeId;
 
-  const [books, sales] = await Promise.all([
+  const [availableBooks, sales] = await Promise.all([
     Book.find(bookFilter).sort({ sort_order: 1 }).lean(),
     BookSale.find({ student_id: studentId, ...filter, status: "active" }).lean(),
   ]);
 
+  // A sale remains visible after its book is retired or the student's grade
+  // changes. Keep the catalog query separate from historical purchases.
+  const availableIds = new Set(availableBooks.map(b => String(b._id)));
+  const historicalIds = [...new Set(sales.map(s => String(s.book_id)))].filter(id => !availableIds.has(id));
+  const historicalBooks = historicalIds.length
+    ? await Book.find({ ...filter, _id: { $in: historicalIds } }).sort({ sort_order: 1 }).lean()
+    : [];
+  const books = [...availableBooks, ...historicalBooks];
   const salesMap = new Map(sales.map((s) => [String(s.book_id), s]));
   const result = books.map(({ _id, __v, ...b }) => {
     const sale = salesMap.get(String(_id));

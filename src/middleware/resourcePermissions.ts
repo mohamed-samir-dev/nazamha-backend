@@ -9,6 +9,16 @@ export function enforceResourcePermissions(req: AuthRequest, res: Response, next
   const module = req.baseUrl.replace(/^\/api\//, "");
   const write = !["GET", "HEAD", "OPTIONS"].includes(req.method);
   const deny = () => { res.status(403).json({ message: "ليس لديك صلاحية لهذه العملية" }); };
+  const studentPayloads = Array.isArray(req.body) ? req.body : [req.body, ...(Array.isArray(req.body?.students) ? req.body.students : [])];
+  const hasStudentField = (pattern: RegExp) => studentPayloads.some(payload => Object.keys(payload || {}).some(k => pattern.test(k)));
+  // These operations synchronize outstanding subscriptions even when no price
+  // field is present. Ordinary name/contact edits and family renames stay open.
+  const familyFinancialWrite = /^\/(link-siblings|unlink-sibling|transfer-family|family-discount)\/?$/.test(req.path)
+    || (req.method === "DELETE" && req.path.startsWith("/family/"));
+  const changesStudentPricing = req.path.includes("discount") || familyFinancialWrite
+    || hasStudentField(/discount|price|sibling_family_id|join_family_id/);
+  const changesStudentLedger = hasStudentField(/months|books/)
+    || (req.method === "PATCH" && hasStudentField(/^(group_id|subscription_start_month|subscription_start_year)$/));
   const staffMap: Record<string, StaffPermission> = { students: "students", groups: "groups", grades: "groups",
     attendance: "attendance", subscriptions: "payments", books: "payments", bills: "payments", "bill-templates": "payments",
     salaries: "payments", "teacher-expenses": "payments", exams: "exams", questions: "exams", "question-banks": "exams",
@@ -32,8 +42,7 @@ export function enforceResourcePermissions(req: AuthRequest, res: Response, next
         : required && u.staff_permissions.includes(required);
       if (!allowed) return deny();
     }
-    const studentPayloads = Array.isArray(req.body) ? req.body : [req.body, ...(Array.isArray(req.body?.students) ? req.body.students : [])];
-    if (module === "students" && write && (req.path.includes("discount") || studentPayloads.some(payload => Object.keys(payload || {}).some(k => /discount|price|months|books/.test(k)))) && !u.staff_permissions.includes("payments")) return deny();
+    if (module === "students" && write && (changesStudentPricing || changesStudentLedger) && !u.staff_permissions.includes("payments")) return deny();
   }
   if (u.is_admin && !u.is_super_admin) {
     const requireAll = (...permissions: FinancialPermission[]) => permissions.every(p => u.financial_permissions.includes(p));
@@ -46,7 +55,8 @@ export function enforceResourcePermissions(req: AuthRequest, res: Response, next
       if (req.path === "/sell-exempt" && !requireAll("financial.applyExemption")) return deny();
     }
     if (module === "dashboard" && !requireAll("financial.viewRevenue")) return deny();
-    if (module === "students" && write && (req.path.includes("discount") || Object.keys(req.body || {}).some(k => /discount|price/.test(k))) && !requireAll("financial.applyDiscount")) return deny();
+    if (module === "students" && write && changesStudentPricing && !requireAll("financial.applyDiscount")) return deny();
+    if (module === "students" && write && changesStudentLedger && !requireAll("financial.editInvoices")) return deny();
     if (module === "teachers" && write && ["password", "hidden_from_admin", "is_active", "plan_id", "features", "subscription_price", "subscription_expires_at"].some(k => k in (req.body || {}))) return deny();
   }
   const canReadFinance = u.staff_permissions !== undefined

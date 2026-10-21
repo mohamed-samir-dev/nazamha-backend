@@ -211,33 +211,8 @@ export async function syncAllStudentsForTeacher(teacherId: string): Promise<numb
   const currentMonth = now.getMonth() + 1;
   const currentYear = now.getFullYear();
 
-  // ── 1. بناء validMonthYears ──────────────────────────────────────────────
-  let validMonthYears: Set<string>;
-  if (activeMonthYears.length > 0) {
-    validMonthYears = new Set(activeMonthYears.map(({ month, year }) => `${month}-${year}`));
-  } else {
-    const academicStartYear = currentMonth >= 7 ? currentYear : currentYear - 1;
-    validMonthYears = new Set(
-      activeMonths.map((m) => {
-        const y = m >= 7 ? academicStartYear : academicStartYear + 1;
-        return `${m}-${y}`;
-      })
-    );
-  }
-
-  // ── 2. حذف الاشتراكات غير المدفوعة للشهور خارج validMonthYears ──────────
-  const allExistingSubs = await MonthlySubscription.find({
-    teacher_id: teacherId,
-    status: { $in: ["due", "not_due"] },
-  }).lean().select("_id month year");
-
-  const toDeleteIds = allExistingSubs
-    .filter((s) => !validMonthYears.has(`${s.month}-${s.year}`))
-    .map((s) => s._id);
-
-  if (toDeleteIds.length > 0) {
-    await MonthlySubscription.deleteMany({ _id: { $in: toDeleteIds } });
-  }
+  // Active periods control generation only. Historical debt, exemptions and
+  // non-due records remain in the ledger when the academic calendar changes.
 
   // ── 3. جلب Groups و Teacher price مرة واحدة ─────────────────────────────
   const groupIds = [...new Set(

@@ -324,18 +324,8 @@ export const fixRolloverData = atomicController(async (req: AuthRequest, res: Re
     "academic_year.active_months": fixed.map((x) => x.month),
   });
 
-  // حذف اشتراكات السنوات الخاطئة غير المدفوعة
-  let deletedCount = 0;
-  if (removedYears.length > 0) {
-    const result = await MonthlySubscription.deleteMany({
-      teacher_id: teacherId,
-      year: { $in: removedYears },
-      status: { $in: ["due", "not_due"] },
-    });
-    deletedCount = result.deletedCount;
-  }
-
-  res.json({ fixed: fixed.length, removedYears, deletedSubscriptions: deletedCount });
+  // Repair the calendar, never erase existing financial obligations.
+  res.json({ fixed: fixed.length, removedYears, deletedSubscriptions: 0 });
 });
 
 // تجديد السنة الأكاديمية: مسح سنة قديمة من active_month_years وإضافة سنة جديدة
@@ -368,12 +358,7 @@ export const rolloverAcademicYear = atomicController(async (req: AuthRequest, re
     "academic_year.active_months": updated.map((x) => x.month),
   });
 
-  // مسح اشتراكات السنة القديمة غير المدفوعة
-  await MonthlySubscription.deleteMany({
-    teacher_id: teacherId,
-    year: oldestYear,
-    status: { $in: ["due", "not_due"] },
-  });
+  // Carry old debt forward by preserving its original ledger rows.
 
   // مزامنة الطلاب مع الشهور الجديدة
   const synced = await syncAllStudentsForTeacher(teacherId);
@@ -506,7 +491,7 @@ export const getSubscriptionsSummary = async (req: AuthRequest, res: Response): 
   ];
 
   const results = await MonthlySubscription.aggregate(pipeline as any[]);
-  res.json(results.map(doc => ({ ...doc, id: String(doc._id) })));
+  res.json(results.map(doc => ({ ...doc, id: doc.studentId })));
 };
 
 
