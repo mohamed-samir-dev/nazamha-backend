@@ -10,6 +10,7 @@ import { SystemSettings } from "../models/SystemSettings";
 import { BookSale } from "../models/BookSale";
 import { StudentMembership } from "../models/StudentMembership";
 import { getTodayInTimezone } from "../utils/timezoneUtils";
+import { reportAttendance } from "../utils/reportAttendance";
 
 export const getPublicStudentReport = async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
@@ -27,7 +28,7 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
   const end = `${prefix}-${new Date(year, month, 0).getDate()}`;
   const scope = { student_id: id, teacher_id: student.teacher_id };
   const [teacher, attendanceRecords, subscriptions, settings, grade, group, examGrades, books, memberships, lastAttendance] = await Promise.all([
-    Teacher.findById(student.teacher_id).select("name").lean(),
+    Teacher.findById(student.teacher_id).select("name subject").lean(),
     AttendanceRecord.find({ ...scope, month, year }).sort({ session_date: 1 }).populate("group_id", "name").lean(),
     MonthlySubscription.find({ ...scope, $or: [{ year: { $lt: year } }, { year, month: { $lte: month } }] }).select("month year status amount discount paid_at receipt_number").sort({ year: -1, month: -1 }).lean(),
     SystemSettings.findOne().select("site_name site_logo").lean(),
@@ -38,6 +39,17 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
     StudentMembership.find({ ...scope, starts_on: { $lte: end }, $or: [{ ends_on: null }, { ends_on: { $gte: start } }] }).populate("group_id", "name").sort({ starts_on: 1 }).lean(),
     AttendanceRecord.findOne({ ...scope, status: "present", session_date: { $lte: end } }).sort({ session_date: -1 }).select("session_date").lean(),
   ]);
+  // A legacy fallback is safe only when there is no membership history at all.
+  // An empty month after leaving a group must not resurrect current membership.
+  const hasHistory = memberships.length > 0 || !!(student.group_id && await StudentMembership.exists(scope));
+  const joinedOn = student.created_at ? new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(student.created_at)) : today;
+  const attendanceMemberships = hasHistory ? memberships : student.group_id ? [{ group_id: { _id: student.group_id, name: group?.name }, starts_on: joinedOn, ends_on: null }] : [];
+  const groupIds = attendanceMemberships.map(m => (m.group_id as any)?._id ?? m.group_id).filter(Boolean);
+  const sessions = groupIds.length ? await AttendanceRecord.aggregate([
+    { $match: { teacher_id: student.teacher_id, group_id: { $in: groupIds }, month, year, session_date: { $gte: start, $lte: end, $lt: today } } },
+    { $group: { _id: { group_id: "$group_id", date: "$session_date" } } },
+  ]) : [];
+  const attendance = reportAttendance(attendanceRecords, attendanceMemberships as any, sessions, today);
   const subscription = subscriptions.find(s => s.month === month && s.year === year);
   const exams = examGrades.filter((row: any) => row.exam_id && row.exam_id.exam_date <= end).map((row: any) => ({ title: row.exam_id.title, date: row.exam_id.exam_date, score: row.score, max_score: row.exam_id.max_score })).sort((a, b) => b.date.localeCompare(a.date));
   const monthlyExams = exams.filter(e => e.date.startsWith(prefix));
@@ -46,12 +58,12 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
   const net = (s: { amount: number; discount?: number }) => Math.max(0, s.amount - (s.discount || 0));
   const lastPaid = subscriptions.find(s => s.status === "paid");
   const lastExam = exams[0];
-  const present = attendanceRecords.filter(r => r.status === "present").length;
-  const absent = attendanceRecords.filter(r => r.status === "absent").length;
+  const present = attendance.filter(r => r.status === "present").length;
+  const absent = attendance.filter(r => r.status !== "present").length;
   res.json({
     id: student._id, name: student.name, code: student.center_student_code || student.code,
     grade_name: grade?.name || "", group_name: group?.name || "", group_day: group?.day_of_week || "", group_time: group?.time || "",
-    teacher_name: teacher?.name || "", site_name: settings?.site_name || "نظمها", site_logo: settings?.site_logo || "",
+    teacher_name: teacher?.name || "", teacher_subject: teacher?.subject || "", site_name: "منصة نظمها", site_logo: settings?.site_logo || "",
     report_month: month, report_year: year, joined_at: student.created_at,
     subscription_start_month: student.subscription_start_month, subscription_start_year: student.subscription_start_year,
     isPaid: subscription?.status === "paid" || subscription?.status === "exempt", payment_status: subscription?.status || "missing",
@@ -61,7 +73,7 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
     last_paid: lastPaid ? { month: lastPaid.month, year: lastPaid.year, amount: net(lastPaid) } : null,
     attendance_present: present, attendance_absent: absent, attendance_total: present + absent,
     last_attendance: lastAttendance?.session_date || null,
-    attendance: attendanceRecords.map((r: any) => ({ date: r.session_date, status: r.status, group: r.group_id?.name || "غير مسجلة" })),
+    attendance,
     exams: monthlyExams, exam_average: average(monthlyExams), exam_average_all_time: average(exams),
     last_exam_title: lastExam?.title, last_exam_score: lastExam?.score ?? null, last_exam_max: lastExam?.max_score, last_exam_date: lastExam?.date,
     books: books.map((b: any) => ({ name: b.book_id?.name || "كتاب سابق", price: b.price, discount: b.discount, amount: b.final_price, exempt: b.is_exempt, date: b.created_at })),

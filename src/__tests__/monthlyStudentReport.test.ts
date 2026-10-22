@@ -24,11 +24,13 @@ test("monthly report retains previous-group attendance, separates period scores 
   const exam = (date: string, score: number, max: number) => ({ score, exam_id: { title: date, exam_date: date, max_score: max } });
   jest.spyOn(ExamGrade, "find").mockReturnValue(chain([exam("2026-10-05", 8, 10), exam("2026-10-12", 10, 20), exam("2026-09-01", 10, 10), exam("2026-11-01", 0, 10)]));
   const books = jest.spyOn(BookSale, "find").mockReturnValue(chain([]));
-  jest.spyOn(StudentMembership, "find").mockReturnValue(chain([]));
+  jest.spyOn(StudentMembership, "find").mockReturnValue(chain([{ group_id: { _id: "group", name: "Current" }, starts_on: "2026-10-01", ends_on: null }]));
+  jest.spyOn(AttendanceRecord, "aggregate").mockResolvedValue([{ _id: { group_id: "group", date: "2026-10-15" } }]);
   const res = response();
   await getPublicStudentReport({ params: { id: "student" }, query: { month: "10", year: "2026" } } as any, res);
   const report = res.json.mock.calls[0][0];
-  expect(report).toMatchObject({ attendance_present: 1, attendance_absent: 1, exam_average: 65, exam_average_all_time: 77, payment_status: "exempt", subscription_amount: 200, arrears_count: 1, arrears_amount: 180, last_exam_score: 10 });
+  expect(report).toMatchObject({ attendance_present: 1, attendance_absent: 2, exam_average: 65, exam_average_all_time: 77, payment_status: "exempt", subscription_amount: 200, arrears_count: 1, arrears_amount: 180, last_exam_score: 10 });
+  expect(report.attendance).toContainEqual({ date: "2026-10-15", status: "unrecorded", group: "Current" });
   expect(report.exams).toHaveLength(2);
   expect(report.attendance[0].group).toBe("Previous");
   expect(attendance).toHaveBeenCalledWith({ student_id: "student", teacher_id: "teacher", month: 10, year: 2026 });

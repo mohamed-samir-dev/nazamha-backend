@@ -615,6 +615,7 @@ export const getStudentBooks = async (req: AuthRequest, res: Response): Promise<
       book_id: String(_id),
       ...b,
       purchased: !!sale,
+      price: sale?.price ?? b.price,
       paid: !!sale && !sale.is_exempt,
       amount: sale?.final_price ?? null,
       discount: sale?.discount ?? null,

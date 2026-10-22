@@ -88,11 +88,11 @@ describe("academic calendar never deletes the ledger", () => {
 
 test.each(["unavailable", "available"])("purchased %s books from prior grades remain in the student's history", async status => {
   jest.spyOn(Student, "findOne").mockReturnValue(chain({ _id: S, grade_id: "444444444444444444444444" }));
-  jest.spyOn(BookSale, "find").mockReturnValue(chain([{ _id: "sale", book_id: B, final_price: 400, discount: 100, status: "active" }]));
-  const find = jest.spyOn(Book, "find").mockReturnValueOnce(chain([])).mockReturnValueOnce(chain([{ _id: B, name: "Historical book", grade_id: "old-grade", status, price: 500 }]));
+  jest.spyOn(BookSale, "find").mockReturnValue(chain([{ _id: "sale", book_id: B, price: 500, final_price: 400, discount: 100, status: "active" }]));
+  const find = jest.spyOn(Book, "find").mockReturnValueOnce(chain([])).mockReturnValueOnce(chain([{ _id: B, name: "Historical book", grade_id: "old-grade", status, price: 900 }]));
   const res = response(); await getStudentBooks(request({ params: { studentId: S } }), res);
   expect(find).toHaveBeenLastCalledWith({ teacher_id: T, _id: { $in: [B] } });
-  expect(res.json).toHaveBeenCalledWith([expect.objectContaining({ book_id: B, purchased: true, amount: 400, sale_id: "sale" })]);
+  expect(res.json).toHaveBeenCalledWith([expect.objectContaining({ book_id: B, purchased: true, price: 500, amount: 400, sale_id: "sale" })]);
 });
 
 test("summary IDs equal student IDs rather than the removed aggregate _id", async () => {
