@@ -25,6 +25,8 @@ describe("financial permission boundaries", () => {
     ["PATCH", "/" + S, { group_id: B }],
     ["PATCH", "/" + S, { subscription_start_month: 12, subscription_start_year: 2026 }],
     ["POST", "/bulk", { students: [{ name: "طالب اختبار", custom_monthly_price: 1 }] }],
+    ["DELETE", "/" + S, {}],
+    ["POST", "/bulk-delete", {ids:[S]}],
   ] as const;
   test.each(routes)("staff without payments cannot %s %s", (method, path, body) => {
     const res = response(), next = jest.fn();
@@ -48,6 +50,10 @@ describe("financial permission boundaries", () => {
   });
   test.each([{ path: "/" + S, method: "PATCH", body: { name: "اسم جديد", parent_phone: "01012345678" } }, { path: "/rename-family", body: { familyId: "abc", familyName: "عائلة جديدة" } }])("ordinary administrative edits remain available", edit => {
     const next = jest.fn(); enforceResourcePermissions(request({ ...edit, user: { ...owner, staff_permissions: ["students"] } }), response(), next); expect(next).toHaveBeenCalledTimes(1);
+  });
+  test.each([{method:'POST',path:'/bulk',body:[{monthly_price:1}]},{method:'PATCH',path:'/group',body:{monthly_price:200}},{method:'DELETE',path:'/group',body:{}}])('group operations cannot bypass financial grants',edit=>{
+    const next=jest.fn(),res=response();enforceResourcePermissions(request({...edit,baseUrl:'/api/groups',user:{...owner,staff_permissions:['groups']}}),res,next);expect(res.statusCode).toBe(403);expect(next).not.toHaveBeenCalled();
+    const adminNext=jest.fn(),adminRes=response();enforceResourcePermissions(request({...edit,baseUrl:'/api/groups',user:{...owner,is_admin:true,financial_permissions:[]}}),adminRes,adminNext);expect(adminRes.statusCode).toBe(403);
   });
 });
 
