@@ -2,20 +2,10 @@ import { Router } from "express";
 import { getAttendance, validateCrossGroupScan, upsertAttendance, bulkUpsertAttendance, deleteAttendance, autoMarkAbsent, batchAutoMarkAbsent, getStudentAttendanceSummary, getAllTimeStats, getLastSessionAbsentees } from "../controllers/attendanceController";
 import { protect } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
-import {listLessons,createLesson,lessonDetails,changeLessonState,markLessonAttendance,lessonRecordHistory,rotateAttendanceCard,attendanceDebt,lessonsReport} from "../controllers/attendanceLessonsController";
 
 const router = Router();
 import { attendanceContext } from "../controllers/attendanceContextController";
 router.use(protect);
-router.get("/lessons", asyncHandler(listLessons));
-router.get("/lessons-report", asyncHandler(lessonsReport));
-router.post("/lessons", asyncHandler(createLesson));
-router.get("/lessons/:id", asyncHandler(lessonDetails));
-router.patch("/lessons/:id/state", asyncHandler(changeLessonState));
-router.post("/lessons/:id/mark", asyncHandler(markLessonAttendance));
-router.get("/history/:recordId", asyncHandler(lessonRecordHistory));
-router.post("/cards/:studentId/replace", asyncHandler(rotateAttendanceCard));
-router.get("/debt/:studentId", asyncHandler(attendanceDebt));
 router.get("/context", asyncHandler(attendanceContext));
 
 router.get("/", asyncHandler(getAttendance));

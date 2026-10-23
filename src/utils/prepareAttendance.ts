@@ -4,8 +4,6 @@ import { getTodayInTimezone } from "./timezoneUtils";
 import { scheduledOn } from "./attendanceSession";
 import {StudentMembership} from "../models/StudentMembership";
 import {AttendanceSession} from "../models/AttendanceSession";
-import {AttendanceLesson} from "../models/AttendanceLesson";
-import {assertAttendanceWindow} from "./attendanceTiming";
 export async function prepareAttendance(teacherId: string, student: { _id: unknown; group_id?: unknown; grade_id?: unknown; group_join_date?: string | null; created_at?: Date }, input: Record<string, unknown>, groups?: Map<string, any>) {
   const date = input.session_date;
   if (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date || date > getTodayInTimezone()) throw new Error("تاريخ الحضور غير صالح أو مستقبلي");
@@ -34,11 +32,5 @@ export async function prepareAttendance(teacherId: string, student: { _id: unkno
     if(!frozen || frozen.cancelled) throw new Error("التاريخ ليس من أيام المجموعة أو حصة محفوظة متاحة");
   }
   const [year, month] = attendanceDate.split("-").map(Number);
-  const managed=await AttendanceLesson.findOne({teacher_id:teacherId,group_id:scannerId,session_date:date,kind:"regular"}).lean();
-  if(managed) {
-    if(managed.state==="cancelled") throw new Error("الحصة ملغاة");
-    if(input.source!=="correction") assertAttendanceWindow(managed);
-    else if(typeof input.reason!=="string" || input.reason.trim().length<3) throw new Error("سبب التصحيح مطلوب");
-  }
   return { student_id: String(student._id), teacher_id: teacherId, group_id: group._id, scanner_group_id: scannerId, scanner_session_date:date, session_date: attendanceDate, year, month, status: String(input.status) };
 }

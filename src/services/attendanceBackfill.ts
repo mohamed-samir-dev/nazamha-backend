@@ -4,7 +4,6 @@ import {Student} from "../models/Student";
 import {StudentMembership} from "../models/StudentMembership";
 import {AttendanceRecord} from "../models/AttendanceRecord";
 import {AttendanceSession} from "../models/AttendanceSession";
-import {AttendanceLesson} from "../models/AttendanceLesson";
 import {endedSession} from "../utils/attendanceSession";
 import {eligibleForSession} from "../utils/sessionEligibility";
 import {getTodayInTimezone} from "../utils/timezoneUtils";
@@ -26,13 +25,9 @@ export async function backfillAttendance() {
  ]);
  const byStudent=new Map<string,any[]>();for(const m of memberships){const id=String(m.student_id);byStudent.set(id,[...(byStudent.get(id)||[]),m]);}
  const snapshots=new Map(frozen.map(s=>[`${s.group_id}|${s.session_date}`,s]));
- const managed=await AttendanceLesson.find({kind:"regular",session_date:{$gte:from,$lte:today}}).lean();
- const managedMap=new Map(managed.map(s=>[`${s.group_id}|${s.session_date}`,s]));
  for(const d=new Date(start);d.toISOString().slice(0,10)<=through;d.setUTCDate(d.getUTCDate()+1)) {
   const date=d.toISOString().slice(0,10),ops:any[]=[],sessionOps:any[]=[];
   for(const group of groups){
-   const lesson=managedMap.get(`${group._id}|${date}`);
-   if(lesson && (lesson.state==="cancelled" || (lesson.state!=="closed" && now<=lesson.closes_at)))continue;
    const snapshot=snapshots.get(`${group._id}|${date}`);
    const g=snapshot?{...group,time:snapshot.time,day_of_week:undefined,cancelled_sessions:snapshot.cancelled?[date]:[]}:group;
    if(!endedSession(g,date,now))continue;
@@ -45,7 +40,7 @@ export async function backfillAttendance() {
     if(!eligibleForSession(g,{...student,group_join_date:membership?.starts_on||student.group_join_date},date))continue;
     const [year,month]=date.split("-").map(Number);
     const row={student_id:student._id,group_id:group._id,teacher_id:group.teacher_id,session_date:date,status:"absent",month,year};
-    ops.push({updateOne:{filter:{student_id:student._id,session_date:date,session_slot:"regular"},update:{$setOnInsert:row},upsert:true}});
+    ops.push({updateOne:{filter:{student_id:student._id,session_date:date},update:{$setOnInsert:row},upsert:true}});
    }
   }
   if(sessionOps.length)await AttendanceSession.bulkWrite(sessionOps);

@@ -1,19 +1,6 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export interface IAttendanceRecord extends Document {
-  session_slot?: string;
-  lesson_id?: mongoose.Types.ObjectId;
-  actual_lesson_id?: mongoose.Types.ObjectId;
-  is_extra?: boolean;
-  voided_at?: Date | null;
-  revision?: number;
-  source?: string;
-  arrived_at?: Date | null;
-  received_at?: Date;
-  device_captured_at?: Date;
-  timing_state?: string;
-  late_minutes?: number | null;
-  history?: any[];
   scanner_group_id?: mongoose.Types.ObjectId | null;
   scanner_session_date?: string;
   student_id: mongoose.Types.ObjectId;
@@ -28,19 +15,6 @@ export interface IAttendanceRecord extends Document {
 
 const AttendanceRecordSchema = new Schema<IAttendanceRecord>(
   {
-    session_slot: { type: String, default: "regular" },
-    lesson_id: {type: Schema.Types.ObjectId, ref: "AttendanceLesson"},
-    actual_lesson_id: {type: Schema.Types.ObjectId, ref: "AttendanceLesson"},
-    is_extra: {type: Boolean, default: false},
-    voided_at: {type: Date, default: null},
-    revision: {type: Number, default: 0},
-    source: {type: String, enum: ["qr", "manual", "offline", "correction", "bulk", "automatic"]},
-    arrived_at: {type: Date, default: null},
-    received_at: Date,
-    device_captured_at: Date,
-    timing_state: {type: String, enum: ["on_time", "late", "unverified"]},
-    late_minutes: {type: Number, default: null},
-    history: [{_id:false, actor_id:String, actor_type:String, at:Date, action:String, reason:String, before:Schema.Types.Mixed, after:Schema.Types.Mixed}],
     scanner_group_id: {type: Schema.Types.ObjectId, ref:"Group", default:null},
     scanner_session_date: {type:String},
     student_id: { type: Schema.Types.ObjectId, ref: "Student", required: true },
@@ -61,7 +35,7 @@ const AttendanceRecordSchema = new Schema<IAttendanceRecord>(
 );
 
 // unique constraint: one record per student per session date
-AttendanceRecordSchema.index({ student_id: 1, session_date: 1, session_slot: 1 }, { unique: true });
+AttendanceRecordSchema.index({ student_id: 1, session_date: 1 }, { unique: true });
 AttendanceRecordSchema.index({ teacher_id: 1, month: 1, year: 1 });
 // all-time-stats aggregation + last-session-absentees: teacher + student + status
 AttendanceRecordSchema.index({ teacher_id: 1, student_id: 1, status: 1 });
@@ -75,12 +49,5 @@ AttendanceRecordSchema.index({ teacher_id: 1, group_id: 1, session_date: 1 });
 // ── Performance indexes (P3) ──────────────────────────────────────────────────
 AttendanceRecordSchema.index({ teacher_id: 1, session_date: 1 }); // dashboard date-range counts
 AttendanceRecordSchema.index({teacher_id:1,scanner_group_id:1,scanner_session_date:1});
-AttendanceRecordSchema.index({teacher_id:1, lesson_id:1});
-
-// Normal readers never count cancelled attendance. History endpoints opt in explicitly.
-AttendanceRecordSchema.pre(/^find/, function(this:any) {
-  const filter=this.getFilter();
-  if (!Object.prototype.hasOwnProperty.call(filter,"voided_at")) this.where({voided_at:null});
-});
 
 export const AttendanceRecord = mongoose.model<IAttendanceRecord>("AttendanceRecord", AttendanceRecordSchema);
