@@ -6,13 +6,14 @@ import {validateCrossGroupAttendance} from "../utils/attendanceScheduleValidator
 import {autoMarkAbsent,batchAutoMarkAbsent,getAttendance,bulkUpsertAttendance} from "../controllers/attendanceController";
 import mongoose from "mongoose";
 import {AttendanceSession} from "../models/AttendanceSession";
+import {AttendanceLesson} from "../models/AttendanceLesson";
 const T="111111111111111111111111",S="222222222222222222222222",G="333333333333333333333333";
 const chain=(v:any):any=>({lean(){return this;},select(){return this;},sort(){return this;},skip(){return this;},limit(){return this;},then(resolve:any,reject:any){return Promise.resolve(v).then(resolve,reject);}});
 const group:any={_id:G,teacher_id:T,time:"10:00",day_of_week:"الإثنين",start_date:"2026-01-01",cancelled_sessions:["2026-10-19"]};
 const student:any={_id:S,group_id:G,group_join_date:"2026-01-01"};
 const req=(body:any={},query:any={}):any=>({user:{id:T,user_type:"teacher"},body,query});
 const res=():any=>({statusCode:200,status(n:number){this.statusCode=n;return this;},json:jest.fn()});
-beforeEach(()=>{jest.useFakeTimers().setSystemTime(new Date("2026-10-23T12:00:00Z"));jest.spyOn(AttendanceSession,"findOne").mockReturnValue(chain(null));});
+beforeEach(()=>{jest.useFakeTimers().setSystemTime(new Date("2026-10-23T12:00:00Z"));jest.spyOn(AttendanceSession,"findOne").mockReturnValue(chain(null));jest.spyOn(AttendanceLesson,"findOne").mockReturnValue(chain(null));jest.spyOn(AttendanceLesson,"find").mockReturnValue(chain([]));});
 afterEach(()=>{jest.restoreAllMocks();jest.useRealTimers();});
 test("same-group attendance rejects a day outside the schedule",async()=>{
  jest.spyOn(Group,"findOne").mockReturnValue(chain(group));
