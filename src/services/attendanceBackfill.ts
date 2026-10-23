@@ -40,7 +40,7 @@ export async function backfillAttendance() {
     if(!eligibleForSession(g,{...student,group_join_date:membership?.starts_on||student.group_join_date},date))continue;
     const [year,month]=date.split("-").map(Number);
     const row={student_id:student._id,group_id:group._id,teacher_id:group.teacher_id,session_date:date,status:"absent",month,year};
-    ops.push({updateOne:{filter:{student_id:student._id,session_date:date},update:{$setOnInsert:row},upsert:true}});
+    ops.push({updateOne:{filter:{student_id:student._id,group_id:group._id,session_date:date},update:{$setOnInsert:row},upsert:true}});
    }
   }
   if(sessionOps.length)await AttendanceSession.bulkWrite(sessionOps);

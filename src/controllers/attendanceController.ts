@@ -12,6 +12,8 @@ import {StudentMembership} from "../models/StudentMembership";
 import {AttendanceSession} from "../models/AttendanceSession";
 import {commitCrossGroupAttendance,verifyAttendanceQR,invalidateSubstitutions} from "../services/crossGroupAttendance";
 import {substitutionError} from "./attendanceSubstitutionController";
+import {effectiveResolutions,mergeAttendanceResolutions} from "../services/attendanceResolutions";
+import {atomicController} from "../services/atomicController";
 const activeSessionStages = [
   {$lookup:{from:"groups",localField:"group_id",foreignField:"_id",as:"attendanceGroup"}},
   {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$attendanceGroup.cancelled_sessions",0]},[]]}]}]}}},
@@ -45,7 +47,8 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
     const studentDocs = await Student.find({ _id: { $in: studentIds } }).lean().select("_id name") as any[];
     const nameMap = new Map(studentDocs.map((s) => [String(s._id), s.name as string]));
     const enriched = records.map((r) => ({ ...r, id:String(r._id), student_name: nameMap.get(String(r.student_id)) ?? null }));
-    res.json(enriched);
+    if(!status){const resolutionScope:any={...base};if(group_id)resolutionScope.target_group_id=group_id;if(session_date)resolutionScope.target_date=session_date;if(req.query.student_id)resolutionScope.student_id=req.query.student_id;res.json(mergeAttendanceResolutions(enriched,await effectiveResolutions(resolutionScope)));}
+    else res.json(enriched);
     return;
   }
 
@@ -77,7 +80,9 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
   const filter: Record<string, unknown> = { ...base, month: m, year: y };
   if (req.query.student_id) filter.student_id = req.query.student_id;
   const records = await AttendanceRecord.find(filter).lean();
-  res.json(records.map((r: any) => ({
+  const prefix=`${y}-${String(m).padStart(2,"0")}`;
+  const resolutions=await effectiveResolutions({...base,target_date:{$gte:`${prefix}-01`,$lte:`${prefix}-31`},...(req.query.student_id?{student_id:req.query.student_id}:{})});
+  res.json(mergeAttendanceResolutions(records.map((r: any) => ({
     ...r,
     id: String(r._id),
     student_id: String(r.student_id),
@@ -85,7 +90,7 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
     teacher_id: r.teacher_id ? String(r.teacher_id) : undefined,
     _id: undefined,
     __v: undefined,
-  })));
+  })),resolutions));
 };
 
 /**
@@ -141,17 +146,26 @@ export const upsertAttendance = async (req: AuthRequest, res: Response): Promise
     await Student.findByIdAndUpdate(record.student_id, { is_suspended: false, suspended_until: null, suspension_reason: null });
   }
 
-  try {
-    const result = await AttendanceRecord.findOneAndUpdate(
-      { student_id: record.student_id, session_date: record.session_date, teacher_id: teacherId, group_id: record.group_id },
-      { $set: record },
-      { upsert: true, new: true, runValidators: true }
-    );
-    res.status(201).json(result);
-  } catch (error: any) {
-    if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور للطالب في مجموعة أخرى بنفس التاريخ؛ تم الحفاظ على السجل السابق" }); return; }
-    throw error;
-  }
+  await atomicController(async (_request, transactionRes) => {
+    const fresh=await Student.findOne({_id:req.body.student_id,teacher_id:teacherId}).lean();
+    if(!fresh || (fresh.is_suspended && (!fresh.suspended_until || new Date(fresh.suspended_until)>=new Date()))) {transactionRes.status(403).json({message:"الطالب غير متاح لتسجيل الحضور"});return;}
+    await Student.updateOne({_id:fresh._id,teacher_id:teacherId},{$inc:{mutation_version:1}});
+    try{await verifyAttendanceQR(teacherId,fresh,req.body.qr_text);}catch(error){if(substitutionError(transactionRes,error))return;throw error;}
+    let prepared;
+    try{prepared=await prepareAttendance(teacherId,fresh,req.body);}catch(error){transactionRes.status(400).json({message:(error as Error).message});return;}
+    await Group.updateOne({_id:prepared.group_id,teacher_id:teacherId},{$inc:{__v:1}});
+    try {
+      const result=await AttendanceRecord.findOneAndUpdate(
+        {student_id:prepared.student_id,session_date:prepared.session_date,teacher_id:teacherId,group_id:prepared.group_id},
+        {$set:prepared,$inc:{attendance_revision:1}}, {upsert:true,new:true,runValidators:true});
+      const actor={id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type};
+      await invalidateSubstitutions({teacher_id:teacherId,student_id:prepared.student_id,target_group_id:prepared.group_id,target_date:prepared.session_date},actor,"تعديل الحضور الفعلي في الحصة الأصلية");
+      if(prepared.status!=="present") await invalidateSubstitutions({teacher_id:teacherId,attendance_id:result!._id},actor,"تم تصحيح الحضور الفعلي إلى غياب");
+      transactionRes.status(201).json(result);
+    } catch(error:any) {
+      if(error?.code===11000){transactionRes.status(409).json({message:"تغير سجل الحضور؛ أعد تحميل الحصة"});return;}throw error;
+    }
+  })(req,res);
 };
 
 export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -210,10 +224,24 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
   })) as any[];
   try {
     if (ops.length > 0) await mongoose.connection.transaction(async session => {
+      const owner=resolvedTeacherId || req.user!.id;
+      const freshStudents=await Student.find({_id:{$in:studentIds},teacher_id:owner}).session(session).lean();
+      for(const fresh of freshStudents) await Student.updateOne({_id:fresh._id,teacher_id:owner},{$inc:{mutation_version:1}},{session});
+      for(const gid of [...new Set(prepared.map(r=>String(r.group_id)))].sort()) await Group.updateOne({_id:gid,teacher_id:owner},{$inc:{__v:1}},{session});
+      for(const r of allowedRecords){
+        const fresh=freshStudents.find(s=>String(s._id)===r.student_id);
+        if(!fresh || (fresh.is_suspended&&(!fresh.suspended_until||new Date(fresh.suspended_until)>=new Date())))throw new Error("تغيرت أهلية الطالب؛ أعد تحميل الحصة");
+        await verifyAttendanceQR(owner,fresh,r.qr_text);
+        const rechecked=await prepareAttendance(owner,fresh,r);
+        const old=prepared.find(p=>p.student_id===r.student_id&&p.session_date===r.session_date);
+        if(!old || String(old.group_id)!==String(rechecked.group_id))throw new Error("تغيرت مجموعة الطالب؛ أعد تحميل الحصة");
+      }
       await AttendanceRecord.bulkWrite(ops, { session });
+      for(const r of prepared) await invalidateSubstitutions({teacher_id:owner,student_id:r.student_id,$or:[{target_group_id:r.group_id,target_date:r.session_date},...(r.status==="present"?[]:[{actual_group_id:r.group_id,actual_date:r.session_date}])]},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"تصحيح جماعي للحضور المرتبط بالتعويض",session);
     });
   } catch (error: any) {
     if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور سابق في مجموعة أخرى؛ لم يتم تغيير أي سجل" }); return; }
+    if(substitutionError(res,error))return;
     throw error;
   }
   const data = prepared.length ? await AttendanceRecord.find({ teacher_id: resolvedTeacherId || req.user!.id, $or: prepared.map(r => ({student_id:r.student_id,group_id:r.group_id,session_date:r.session_date})) }) : [];
@@ -338,10 +366,13 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
   res.json(result);
 };
 
-export const deleteAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
-  await AttendanceRecord.findOneAndDelete({ _id: req.params.id, ...teacherFilter(req) });
-  res.json({ message: "تم الحذف بنجاح" });
-};
+export const deleteAttendance = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
+  const record=await AttendanceRecord.findOne({_id:req.params.id,...teacherFilter(req)}).lean();
+  if(!record){res.status(404).json({message:"سجل الحضور غير موجود"});return;}
+  await invalidateSubstitutions({teacher_id:record.teacher_id,attendance_id:record._id},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"تم إلغاء الحضور الفعلي؛ التعويض أو الإعفاء يحتاج مراجعة");
+  await AttendanceRecord.findOneAndDelete({_id:record._id,...teacherFilter(req)});
+  res.json({message:"تم إلغاء الحضور؛ حُفظ تاريخ التعويض للمراجعة"});
+});
 
 // تسجيل غياب تلقائي لكل طالب لم يُسجَّل حضوره بعد مرور ساعة على وقت الحصة
 export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -387,7 +418,7 @@ export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<v
       status: "absent",
     }));
 
-  const saved=toInsert.length ? await AttendanceRecord.bulkWrite(toInsert.map(r => ({updateOne:{filter:{student_id:r.student_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}})) as any) : null;
+  const saved=toInsert.length ? await AttendanceRecord.bulkWrite(toInsert.map(r => ({updateOne:{filter:{student_id:r.student_id,group_id:r.group_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}})) as any) : null;
   res.json({ marked: saved?.upsertedCount || 0 });
 };
 
@@ -453,6 +484,6 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
     }
   }
 
-  const saved=toInsert.length ? await AttendanceRecord.bulkWrite((toInsert as any[]).map(r => ({updateOne:{filter:{student_id:r.student_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}}))) : null;
+  const saved=toInsert.length ? await AttendanceRecord.bulkWrite((toInsert as any[]).map(r => ({updateOne:{filter:{student_id:r.student_id,group_id:r.group_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}}))) : null;
   res.json({ marked: saved?.upsertedCount || 0 });
 };

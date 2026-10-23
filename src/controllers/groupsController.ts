@@ -311,6 +311,7 @@ async function repriceGroupSubscriptions(groupIds: string[], scope: Record<strin
 
 import {freezeAttendanceSchedule} from "../services/attendanceSessions";
 import {AttendanceSession} from "../models/AttendanceSession";
+import {invalidateSubstitutions} from "../services/crossGroupAttendance";
 export const updateGroup = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const validation = groupValidationError(req.body, true);
@@ -386,6 +387,7 @@ export const toggleCancelSession = atomicController(async (req: AuthRequest, res
       : [...cancelled, date];
     await AttendanceSession.updateOne({group_id:group._id,session_date:date},{$set:{cancelled:updated.includes(date)},$setOnInsert:{teacher_id:group.teacher_id,group_id:group._id,session_date:date,time:group.time}},{upsert:true});
     group.cancelled_sessions = updated;
+    if(updated.includes(date)) await invalidateSubstitutions({teacher_id:group.teacher_id,$or:[{actual_group_id:group._id,actual_date:date},{target_group_id:group._id,target_date:date}]},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"إلغاء حصة مرتبطة بالتعويض أو الإعفاء؛ يلزم مراجعة");
     await group.save();
     res.json(group);
   } catch (error: any) {

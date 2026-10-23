@@ -14,7 +14,7 @@ import {validStudentCard} from "../utils/studentCard";
 import {series} from "./atomicController";
 
 export class AttendanceConflict extends Error {constructor(message:string,public status=409){super(message);}}
-const fail=(message:string,status=409):never=>{throw new AttendanceConflict(message,status);};
+function fail(message:string,status=409):never {throw new AttendanceConflict(message,status);}
 export const validAttendanceId=(id:unknown):id is string=>typeof id==="string"&&/^[a-f\d]{24}$/i.test(id);
 const id=(value:unknown)=>String(value || "");
 const read=(query:any,session?:ClientSession)=>query.session(session || null).lean();
@@ -162,6 +162,7 @@ export async function reverseSubstitution(teacherId:string,substitutionId:string
    if(row.state==="revoked"){result=row;return;}
    result=await AttendanceSubstitution.findOneAndUpdate({_id:row._id,teacher_id:teacherId,state:row.state},{$set:{active:false,state:"revoked"},$push:{history:actorEvent(actor,"reverse",reason.trim(),row.state,"revoked")}},{new:true,session});
    if(!result)fail("تغير سجل التعويض؛ أعد التحميل");
+   await AttendanceRecord.updateOne({_id:row.attendance_id,teacher_id:teacherId},{$set:{attendance_kind:"guest"},$inc:{attendance_revision:1}},{session});
    await AuditLog.create([{actor_id:actor.id,actor_type:actor.type,teacher_id:teacherId,action:"request.write",resource_type:"attendance_substitution",resource_id:id(row._id),old_data:{state:row.state},new_data:{state:"revoked",reason:reason.trim()},outcome:"success"}],{session});
  });
  return result;
