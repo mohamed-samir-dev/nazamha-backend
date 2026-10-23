@@ -18,6 +18,7 @@ import { getTodayInTimezone } from "../utils/timezoneUtils";
 import mongoose from "mongoose";
 import { validStudentName } from "../utils/studentName";
 import { studentCardToken } from "../utils/studentCard";
+import { studentSearchFilter } from "../utils/studentSearch";
 
 // الحقول المسموح للـ client بتعديلها فقط
 const STUDENT_UPDATABLE_FIELDS = new Set([
@@ -89,17 +90,7 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
     const filter: Record<string, unknown> = { ...teacherFilter(req) };
 
     if (req.query.search) {
-      const q = String(req.query.search).trim();
-      const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const isCode = /^[A-Za-z0-9\-]+$/.test(q);
-      if (isCode) {
-        filter.$or = [
-          { code: { $regex: escaped, $options: "i" } },
-          { name: { $regex: escaped, $options: "i" } },
-        ];
-      } else {
-        filter.name = { $regex: escaped, $options: "i" };
-      }
+      Object.assign(filter, studentSearchFilter(String(req.query.search)));
     }
     if (req.query.group_id) {
       filter.group_id = req.query.group_id === "none" ? null : req.query.group_id;
