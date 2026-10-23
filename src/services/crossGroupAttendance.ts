@@ -11,6 +11,7 @@ import {buildLocalDate,getTodayInTimezone} from "../utils/timezoneUtils";
 import {scheduledOn,validAttendanceDate} from "../utils/attendanceSession";
 import {findScannedStudent} from "../utils/studentScan";
 import {validStudentCard} from "../utils/studentCard";
+import {series} from "./atomicController";
 
 export class AttendanceConflict extends Error {constructor(message:string,public status=409){super(message);}}
 const fail=(message:string,status=409):never=>{throw new AttendanceConflict(message,status);};
@@ -64,7 +65,7 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
  const today=getTodayInTimezone(),lower=new Date(today+"T12:00:00Z");lower.setUTCDate(lower.getUTCDate()-90);
  const upper=new Date(today+"T12:00:00Z");upper.setUTCDate(upper.getUTCDate()+56);
  const from=lower.toISOString().slice(0,10),to=upper.toISOString().slice(0,10);
- const [snapshots,memberships,records,substitutions]=await Promise.all([
+ const [snapshots,memberships,records,substitutions]=await (session?series:Promise.all.bind(Promise))([
    read(AttendanceSession.find({teacher_id:teacherId,group_id:{$in:[original._id,destination._id]},session_date:{$gte:from,$lte:to}}),session),
    read(StudentMembership.find({teacher_id:teacherId,student_id:student._id}).sort({starts_on:-1}),session),
    read(AttendanceRecord.find({teacher_id:teacherId,student_id:student._id,session_date:{$gte:from,$lte:to}}),session),
@@ -135,6 +136,10 @@ export async function commitCrossGroupAttendance(teacherId:string,input:CrossGro
    const record=await AttendanceRecord.findOneAndUpdate({teacher_id:teacherId,student_id:c.student._id,group_id:c.destination._id,session_date:c.actual.date},{$set:{status:"present",attendance_kind:input.action==="guest"?"guest":"substitute",original_group_id:c.original._id,session_id:actualSession._id,scanner_group_id:c.destination._id,scanner_session_date:c.actual.date,month:Number(c.actual.date.slice(5,7)),year:Number(c.actual.date.slice(0,4))},$inc:{attendance_revision:1}},{upsert:true,new:true,runValidators:true,session});
    let substitution:any;
    if(option){
+     if(input.action==="compensate") {
+       const locked=await AttendanceRecord.updateOne({teacher_id:teacherId,student_id:c.student._id,group_id:c.original._id,session_date:option.date,status:"absent"},{$inc:{attendance_revision:1}},{session});
+       if(!locked.matchedCount)fail("الغياب السابق تغير ولم يعد مؤهلًا للتعويض");
+     }
      const target=await ensureSession(teacherId,c.original,option.date,option.time,session);
      [substitution]=await AttendanceSubstitution.create([{teacher_id:teacherId,student_id:c.student._id,original_group_id:c.original._id,actual_group_id:c.destination._id,actual_date:c.actual.date,actual_session_id:actualSession._id,attendance_id:record!._id,target_group_id:c.original._id,target_date:option.date,target_session_id:target._id,kind:input.action,approved_by:actor.id,active:true,state:"approved",history:[actorEvent(actor,"approve",input.reason || "اعتماد من شاشة سكان الحضور","none","approved")]}],{session});
    }

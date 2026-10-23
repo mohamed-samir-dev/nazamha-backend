@@ -6,7 +6,6 @@ import { Student } from "../models/Student";
 import { Group } from "../models/Group";
 import { AuthRequest, teacherFilter, canAccessTeacher } from "../middleware/auth";
 import { buildLocalDate } from "../utils/timezoneUtils";
-import { validateCrossGroupAttendance } from "../utils/attendanceScheduleValidator";
 import { endedSession, validAttendanceDate } from "../utils/attendanceSession";
 import { eligibleForSession } from "../utils/sessionEligibility";
 import {StudentMembership} from "../models/StudentMembership";
@@ -93,121 +92,7 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
  * التحقق من صلاحية تسجيل حضور طالب عبر المجموعات
  * يُستخدم قبل عرض تأكيد الحضور في Frontend
  */
-export const validateCrossGroupScan = async (req: AuthRequest, res: Response): Promise<void> => {
-  const { student_id, scanner_group_id, requested_date } = req.body;
-
-  if (!student_id || !scanner_group_id) {
-    res.status(400).json({ message: "معلومات غير كافية للتحقق" });
-    return;
-  }
-
-  // Determine effective teacher ID
-  let teacherId: string;
-  if (req.user!.user_type === "staff" && req.user!.effective_teacher_id) {
-    teacherId = req.user!.effective_teacher_id;
-  } else if (req.user!.is_admin) {
-    teacherId = req.body.teacher_id || req.user!.id;
-    if (!canAccessTeacher(req, teacherId)) { res.status(403).json({ message: "غير مصرح" }); return; }
-  } else if (req.user!.user_type === "center" || req.user!.user_type === "staff") {
-    teacherId = req.body.teacher_id;
-    if (!req.user!.center_teacher_ids?.includes(teacherId)) {
-      res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور لهذا المدرس" });
-      return;
-    }
-  } else {
-    teacherId = req.user!.id;
-  }
-
-  // Check ownership: student must belong to this teacher
-  const student = await Student.findOne({ _id: student_id, teacher_id: teacherId })
-    .lean()
-    .select("_id name group_id grade_id is_suspended suspended_until suspension_reason") as any;
-
-  if (!student) {
-    res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور هذا الطالب" });
-    return;
-  }
-
-  // Check suspension
-  if (student.is_suspended) {
-    if (!student.suspended_until || new Date(student.suspended_until) >= new Date()) {
-      res.status(403).json({
-        message: "هذا الطالب محظور ولا يمكن تسجيل حضوره",
-        suspended: true,
-        suspended_until: student.suspended_until,
-        suspension_reason: student.suspension_reason,
-        name: student.name,
-      });
-      return;
-    }
-    // Auto-lift expired suspension
-    await Student.findByIdAndUpdate(student_id, {
-      is_suspended: false,
-      suspended_until: null,
-      suspension_reason: null,
-    });
-  }
-
-  // Load student's original group
-  let studentGroup: { id: string; name: string; day_of_week: string; start_date?: string | null; grade_id?: string; cancelled_sessions?:string[] } | null = null;
-  if (student.group_id) {
-    const grp = await Group.findOne({ _id: student.group_id, teacher_id: teacherId })
-      .lean()
-      .select("_id name day_of_week start_date grade_id cancelled_sessions") as any;
-    if (grp) {
-      studentGroup = {
-        id: grp._id.toString(),
-        name: grp.name,
-        day_of_week: grp.day_of_week,
-        start_date: grp.start_date || null,
-        grade_id: grp.grade_id?.toString(),
-        cancelled_sessions: grp.cancelled_sessions,
-      };
-    }
-  }
-
-  // Load scanner group for grade comparison
-  const scannerGroup = await Group.findOne({ _id: scanner_group_id, teacher_id: teacherId })
-    .lean()
-    .select("_id grade_id") as any;
-
-  if (!scannerGroup) {
-    res.status(404).json({ message: "المجموعة المفتوحة غير موجودة" });
-    return;
-  }
-
-  // Check if student's grade differs from scanner group's grade
-  const studentGradeId = student.grade_id?.toString();
-  const scannerGradeId = scannerGroup.grade_id?.toString();
-
-  if (studentGradeId && scannerGradeId && studentGradeId !== scannerGradeId) {
-    // Return 200 with deny decision instead of 403
-    res.status(200).json({
-      decision: "deny",
-      reason: "الطالب من صف مختلف عن المجموعة المفتوحة",
-      studentGroupId: studentGroup?.id || null,
-      studentGroupName: studentGroup?.name || "لا توجد مجموعة",
-      studentGroupSchedule: studentGroup?.day_of_week || "—",
-      nextScheduledDate: null,
-      scheduledDateIsToday: false,
-      scheduledDateIsFuture: false,
-      scheduledDateInCurrentWeek: false,
-      scheduledDateInNextWeek: false,
-    });
-    return;
-  }
-
-  // Validate cross-group attendance using schedule logic
-  const timezone = "Africa/Cairo"; // TODO: load from teacher settings if available
-  const validation = await validateCrossGroupAttendance(
-    studentGroup,
-    scanner_group_id,
-    requested_date || new Date().toISOString().slice(0, 10),
-    timezone
-  );
-
-  res.json(validation);
-};
+export {eligibility as validateCrossGroupScan} from "./attendanceSubstitutionController";
 
 export const upsertAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
   // For assistant: always use effective_teacher_id (ignore body teacher_id for security)

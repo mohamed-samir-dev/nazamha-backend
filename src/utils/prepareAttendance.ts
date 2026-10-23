@@ -1,5 +1,4 @@
 import { Group } from "../models/Group";
-import { validateCrossGroupAttendance } from "./attendanceScheduleValidator";
 import { getTodayInTimezone } from "./timezoneUtils";
 import { scheduledOn } from "./attendanceSession";
 import {StudentMembership} from "../models/StudentMembership";
@@ -19,14 +18,7 @@ export async function prepareAttendance(teacherId: string, student: { _id: unkno
   const scannerId = String(input.scanner_group_id || input.group_id || group._id);
   let attendanceDate = date;
   if (scannerId !== String(group._id)) {
-    const scanner = await loadGroup(scannerId);
-    if (!scanner || (scanner.grade_id && group.grade_id && String(scanner.grade_id) !== String(group.grade_id))) throw new Error("المجموعة أو المرحلة غير متوافقة");
-    const check = await validateCrossGroupAttendance({ ...group, id: String(group._id) }, scannerId, date);
-    if (check.decision === "deny") throw new Error(check.reason);
-    attendanceDate = check.nextScheduledDate || date;
-    if(joined && attendanceDate < joined) throw new Error("الحصة الأصلية قبل انضمام الطالب");
-    if (check.decision === "confirm" && input.cross_group_confirmed !== true) throw new Error("يلزم تأكيد الحضور خارج المجموعة");
-    if (!scheduledOn(scanner, date) || scanner.cancelled_sessions?.includes(date)) throw new Error("الجلسة المختارة ليست حصة متاحة لمجموعة السكان");
+    throw new Error("الحضور خارج المجموعة يحتاج اختيار ضيف أو تعويض أو إعفاء من شاشة السكان");
   } else if (!scheduledOn(group, date)) {
     const frozen=await AttendanceSession.findOne({group_id:group._id,teacher_id:teacherId,session_date:date}).lean();
     if(!frozen || frozen.cancelled) throw new Error("التاريخ ليس من أيام المجموعة أو حصة محفوظة متاحة");
