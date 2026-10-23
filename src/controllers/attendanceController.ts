@@ -14,6 +14,11 @@ import {commitCrossGroupAttendance,verifyAttendanceQR,invalidateSubstitutions} f
 import {substitutionError} from "./attendanceSubstitutionController";
 import {effectiveResolutions,mergeAttendanceResolutions} from "../services/attendanceResolutions";
 import {atomicController} from "../services/atomicController";
+import {AttendanceSubstitution} from "../models/AttendanceSubstitution";
+const resolvedAbsenceStages=[
+ {$lookup:{from:AttendanceSubstitution.collection.name,let:{sid:"$student_id",gid:"$group_id",date:"$session_date"},pipeline:[{$match:{$expr:{$and:[{$eq:["$student_id","$$sid"]},{$eq:["$target_group_id","$$gid"]},{$eq:["$target_date","$$date"]},{$eq:["$active",true]},{$eq:["$state","approved"]}]}}}],as:"attendanceResolution"}},
+ {$match:{$or:[{status:"present"},{"attendanceResolution.0":{$exists:false}}]}},
+];
 const activeSessionStages = [
   {$lookup:{from:"groups",localField:"group_id",foreignField:"_id",as:"attendanceGroup"}},
   {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$attendanceGroup.cancelled_sessions",0]},[]]}]}]}}},
@@ -259,19 +264,22 @@ export const getStudentAttendanceSummary = async (req: AuthRequest, res: Respons
   const records = await AttendanceRecord.find({
     student_id: studentId,
     ...teacherFilter(req),
-  }).lean().select("status month year session_date group_id") as any[];
+  }).lean().select("status month year session_date group_id attendance_kind") as any[];
+  const resolved=mergeAttendanceResolutions(records,await effectiveResolutions({...teacherFilter(req),student_id:studentId}));
   const groupIds=[...new Set(records.map(r=>r.group_id).filter(Boolean))];
   const groups=groupIds.length ? await Group.find({_id:{$in:groupIds}}).select("cancelled_sessions").lean() : [];
   const cancelled=new Map(groups.map(g=>[String(g._id),new Set(g.cancelled_sessions||[])]));
 
 
 
-  const map = new Map<string, { present: number; absent: number; month: number; year: number }>();
-  for (const r of records) {
+  const map = new Map<string, { present: number; absent: number; month: number; year: number;compensated?:number;exempt?:number;guest?:number }>();
+  for (const r of resolved) {
     if(cancelled.get(String(r.group_id))?.has(r.session_date))continue;
     const key = `${r.year}-${r.month}`;
     const cur = map.get(key) ?? { present: 0, absent: 0, month: r.month, year: r.year };
-    if (r.status === "present") cur.present++; else cur.absent++;
+    if(r.resolution)cur[r.resolution==="compensated"?"compensated":"exempt"]=(cur[r.resolution==="compensated"?"compensated":"exempt"]||0)+1;
+    else if(r.attendance_kind==="guest"||r.attendance_kind==="substitute")cur.guest=(cur.guest||0)+1;
+    else if (r.status === "present") cur.present++; else cur.absent++;
     map.set(key, cur);
   }
   const summary = Array.from(map.values()).sort((a, b) =>
@@ -285,6 +293,8 @@ export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<
   const pipeline = [
     { $match: matchBase },
     ...activeSessionStages,
+    {$match:{attendance_kind:{$nin:["guest","substitute"]}}},
+    ...resolvedAbsenceStages,
     { $group: { _id: { student_id: "$student_id", status: "$status" }, count: { $sum: 1 } } },
     { $group: {
       _id: "$_id.student_id",
@@ -315,6 +325,8 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
   ];
   const lastSessions = await AttendanceRecord.aggregate(lastSessionPipeline) as { _id: string; lastDate: string }[];
   if (lastSessions.length === 0) { res.json({}); return; }
+  const resolutions=await effectiveResolutions({...base,$or:lastSessions.map(s=>({target_group_id:s._id,target_date:s.lastDate}))});
+  const resolvedTargets=new Set(resolutions.map(r=>`${r.student_id}|${r.target_group_id}|${r.target_date}`));
 
   // خطوة 2: من كان حاضراً في آخر حصة لكل مجموعة
   const orConditions = lastSessions.map((s) => ({ group_id: s._id, session_date: s.lastDate, status: "present" }));
@@ -357,6 +369,7 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
         const joinDate = membership?.starts_on || s.group_join_date || s.created_at?.toISOString().slice(0,10) || null;
         if(!eligibleForSession(group,{...s,group_join_date:joinDate},lastDate))return false;
         if (joinDate && joinDate > lastDate) return false;
+        if(resolvedTargets.has(`${s._id}|${key}|${lastDate}`))return false;
         return !presentIds.has(String(s._id));
       })
       .map((s: any) => ({ id: String(s._id), name: s.name, code: s.code ?? null }));
@@ -457,7 +470,7 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
     }).lean().select("student_id group_id session_date"),
   ]);
 
-  const existingSet = new Set(existingRecords.map((r: any) => `${String(r.student_id)}|${r.session_date}`));
+  const existingSet = new Set(existingRecords.map((r: any) => `${String(r.student_id)}|${String(r.group_id)}|${r.session_date}`));
   const studentsByGroup = new Map<string, any[]>();
   for (const s of allStudents) {
     const key = String(s.group_id);
@@ -469,7 +482,7 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
   for (const { group_id, session_date } of validSessions) {
     const groupStudents = studentsByGroup.get(group_id) ?? [];
     for (const s of groupStudents) {
-      const key = `${String(s._id)}|${session_date}`;
+      const key = `${String(s._id)}|${group_id}|${session_date}`;
       const joinDate = s.group_join_date || new Date(s.created_at).toISOString().slice(0, 10);
       if (!existingSet.has(key) && joinDate <= session_date && eligibleForSession(groupMap.get(group_id), s, session_date)) {
         existingSet.add(key);

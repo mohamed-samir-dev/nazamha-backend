@@ -11,6 +11,7 @@ import { BookSale } from "../models/BookSale";
 import { StudentMembership } from "../models/StudentMembership";
 import { getTodayInTimezone } from "../utils/timezoneUtils";
 import { reportAttendance } from "../utils/reportAttendance";
+import {effectiveResolutions,mergeAttendanceResolutions} from "../services/attendanceResolutions";
 
 export const getPublicStudentReport = async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
@@ -29,7 +30,7 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
   const scope = { student_id: id, teacher_id: student.teacher_id };
   const [teacher, attendanceRecords, subscriptions, settings, grade, group, examGrades, books, memberships, lastAttendance] = await Promise.all([
     Teacher.findById(student.teacher_id).select("name subject").lean(),
-    AttendanceRecord.find({ ...scope, month, year }).sort({ session_date: 1 }).populate("group_id", "name").lean(),
+    AttendanceRecord.find({ ...scope, month, year }).sort({ session_date: 1 }).populate("group_id", "name cancelled_sessions").lean(),
     MonthlySubscription.find({ ...scope, $or: [{ year: { $lt: year } }, { year, month: { $lte: month } }] }).select("month year status amount discount paid_at receipt_number").sort({ year: -1, month: -1 }).lean(),
     SystemSettings.findOne().select("site_name site_logo").lean(),
     student.grade_id ? Grade.findById(student.grade_id).select("name").lean() : null,
@@ -49,7 +50,9 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
     { $match: { teacher_id: student.teacher_id, group_id: { $in: groupIds }, month, year, session_date: { $gte: start, $lte: end, $lt: today } } },
     { $group: { _id: { group_id: "$group_id", date: "$session_date" } } },
   ]) : [];
-  const attendance = reportAttendance(attendanceRecords, attendanceMemberships as any, sessions, today);
+  const resolutions=await effectiveResolutions({...scope,target_date:{$gte:start,$lte:end}});
+  const merged=mergeAttendanceResolutions(attendanceRecords,resolutions).map(r=>({...r,group_id:attendanceMemberships.find(m=>String((m.group_id as any)?._id || m.group_id)===String(r.group_id?._id || r.group_id))?.group_id || r.group_id}));
+  const attendance = reportAttendance(merged.filter(r=>!r.group_id?.cancelled_sessions?.includes(r.session_date)), attendanceMemberships as any, sessions, today);
   const subscription = subscriptions.find(s => s.month === month && s.year === year);
   const exams = examGrades.filter((row: any) => row.exam_id && row.exam_id.exam_date <= end).map((row: any) => ({ title: row.exam_id.title, date: row.exam_id.exam_date, score: row.score, max_score: row.exam_id.max_score })).sort((a, b) => b.date.localeCompare(a.date));
   const monthlyExams = exams.filter(e => e.date.startsWith(prefix));
@@ -59,9 +62,10 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
   const lastPaid = subscriptions.find(s => s.status === "paid");
   const lastExam = exams[0];
   const present = attendance.filter(r => r.status === "present").length;
-  const absent = attendance.filter(r => r.status !== "present").length;
+  const absent = attendance.filter(r => r.status === "absent" || r.status==="unrecorded").length;
   res.json({
     id: student._id, name: student.name, code: student.center_student_code || student.code,
+    attendance_compensated:attendance.filter(r=>r.status==="compensated").length,attendance_exempt:attendance.filter(r=>r.status==="exempt").length,attendance_guest:attendance.filter(r=>r.status==="guest").length,
     grade_name: grade?.name || "", group_name: group?.name || "", group_day: group?.day_of_week || "", group_time: group?.time || "",
     teacher_name: teacher?.name || "", teacher_subject: teacher?.subject || "", site_name: "منصة نظمها", site_logo: settings?.site_logo || "",
     report_month: month, report_year: year, joined_at: student.created_at,

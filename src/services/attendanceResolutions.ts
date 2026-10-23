@@ -22,7 +22,7 @@ export async function effectiveResolutions(scope:Record<string,unknown>){
 export function mergeAttendanceResolutions(records:any[],resolutions:any[]){
  const rows=records.map(r=>({...r}));
  for(const resolution of resolutions){
-   let row=rows.find(r=>String(r.student_id)===String(resolution.student_id)&&String(r.group_id)===String(resolution.target_group_id)&&r.session_date===resolution.target_date);
+   let row=rows.find(r=>String(r.student_id)===String(resolution.student_id)&&String(r.group_id?._id || r.group_id)===String(resolution.target_group_id)&&r.session_date===resolution.target_date);
    if(row?.status==="present")continue;
    if(!row){const [year,month]=resolution.target_date.split("-").map(Number);row={id:`resolution-${resolution._id}`,student_id:String(resolution.student_id),group_id:String(resolution.target_group_id),teacher_id:String(resolution.teacher_id),session_date:resolution.target_date,year,month,status:"absent",derived:true};rows.push(row);}
    row.resolution=resolution.kind==="compensate"?"compensated":"exempt";
