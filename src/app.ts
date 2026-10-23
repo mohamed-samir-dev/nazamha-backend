@@ -120,6 +120,10 @@ app.get("/api/ready", async (_req, res) => {
   res.status(ready ? 200 : 503).json({ ready, database, sharedCounters });
 });
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+// Separate scheduler authentication; never expose this through teacher permissions.
+import {attendanceJob} from "./controllers/attendanceJobController";
+import {asyncHandler as attendanceJobHandler} from "./middleware/asyncHandler";
+app.get("/api/jobs/attendance",attendanceJobHandler(attendanceJob));
 
 // Error handling
 app.use(notFound);

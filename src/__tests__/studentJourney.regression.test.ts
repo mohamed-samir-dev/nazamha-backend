@@ -31,10 +31,10 @@ test("same-day record in previous group cannot be overwritten",async()=>{
  const r=res();await upsertAttendance(req({body:{student_id:S,session_date:"2025-01-02",status:"present"}}),r);
  expect(r.statusCode).toBe(409);expect(write.mock.calls[0][0]).toMatchObject({teacher_id:T,group_id:G,student_id:S,session_date:"2025-01-02"});
 });
-test("next Sunday retains correct calendar date in Cairo",async()=>{
+test("requested-week Sunday retains correct calendar date in Cairo",async()=>{
  jest.useFakeTimers().setSystemTime(new Date("2026-10-11T22:00:00Z"));
  const result=await validateCrossGroupAttendance({id:G,name:"الأحد",day_of_week:"الأحد"},S,"2026-10-12");
- expect(result.nextScheduledDate).toBe("2026-10-18");expect(result.reason).toContain("الأحد 2026-10-18");expect(result.decision).toBe("deny");
+ expect(result.nextScheduledDate).toBe("2026-10-11");expect(result.reason).toContain("2026-10-11");expect(result.decision).toBe("confirm");
 });
 test.each([false,true])("grade mismatch cannot be bypassed by changing grade with group (%s)",async(changeGrade)=>{
  jest.spyOn(Student,"findOne").mockReturnValue(chain({_id:S,teacher_id:T,grade_id:Y,group_id:S}));

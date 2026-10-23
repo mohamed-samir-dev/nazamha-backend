@@ -1,6 +1,8 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export interface IAttendanceRecord extends Document {
+  scanner_group_id?: mongoose.Types.ObjectId | null;
+  scanner_session_date?: string;
   student_id: mongoose.Types.ObjectId;
   session_date: string;
   month: number;
@@ -13,6 +15,8 @@ export interface IAttendanceRecord extends Document {
 
 const AttendanceRecordSchema = new Schema<IAttendanceRecord>(
   {
+    scanner_group_id: {type: Schema.Types.ObjectId, ref:"Group", default:null},
+    scanner_session_date: {type:String},
     student_id: { type: Schema.Types.ObjectId, ref: "Student", required: true },
     session_date: { type: String, required: true },
     month: { type: Number, required: true },
@@ -44,5 +48,6 @@ AttendanceRecordSchema.index({ teacher_id: 1, group_id: 1, session_date: 1 });
 
 // ── Performance indexes (P3) ──────────────────────────────────────────────────
 AttendanceRecordSchema.index({ teacher_id: 1, session_date: 1 }); // dashboard date-range counts
+AttendanceRecordSchema.index({teacher_id:1,scanner_group_id:1,scanner_session_date:1});
 
 export const AttendanceRecord = mongoose.model<IAttendanceRecord>("AttendanceRecord", AttendanceRecordSchema);

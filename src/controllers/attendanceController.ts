@@ -7,6 +7,14 @@ import { Group } from "../models/Group";
 import { AuthRequest, teacherFilter, canAccessTeacher } from "../middleware/auth";
 import { buildLocalDate } from "../utils/timezoneUtils";
 import { validateCrossGroupAttendance } from "../utils/attendanceScheduleValidator";
+import { endedSession, validAttendanceDate } from "../utils/attendanceSession";
+import { eligibleForSession } from "../utils/sessionEligibility";
+import {StudentMembership} from "../models/StudentMembership";
+import {AttendanceSession} from "../models/AttendanceSession";
+const activeSessionStages = [
+  {$lookup:{from:"groups",localField:"group_id",foreignField:"_id",as:"attendanceGroup"}},
+  {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$attendanceGroup.cancelled_sessions",0]},[]]}]}]}}},
+];
 
 /** تحويل teacher_id filter إلى ObjectId للاستخدام في aggregation $match */
 function toAggregationFilter(base: Record<string, unknown>): Record<string, unknown> {
@@ -26,33 +34,36 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
 
   if (group_id || session_date) {
     const filter: Record<string, unknown> = { ...base };
-    if (group_id) filter.group_id = group_id;
-    if (session_date) filter.session_date = session_date;
+    if (group_id && session_date) filter.$or = [{group_id,session_date}, {scanner_group_id:group_id,scanner_session_date:session_date}];
+    else if(group_id) filter.$or = [{group_id}, {scanner_group_id:group_id}];
+    else if(session_date) filter.$or = [{session_date},{scanner_session_date:session_date}];
     if (status) filter.status = status;
     if (req.query.student_id) filter.student_id = req.query.student_id;
     const records = await AttendanceRecord.find(filter).lean() as any[];
     const studentIds = [...new Set(records.map((r) => String(r.student_id)))];
     const studentDocs = await Student.find({ _id: { $in: studentIds } }).lean().select("_id name") as any[];
     const nameMap = new Map(studentDocs.map((s) => [String(s._id), s.name as string]));
-    const enriched = records.map((r) => ({ ...r, student_name: nameMap.get(String(r.student_id)) ?? null }));
+    const enriched = records.map((r) => ({ ...r, id:String(r._id), student_name: nameMap.get(String(r.student_id)) ?? null }));
     res.json(enriched);
     return;
   }
 
   const { limit } = req.query;
-  if (limit) {
+  if (limit || req.query.all === "true") {
+    const size = Number(limit || 1000), page = Number(req.query.page || 1);
+    if (!Number.isInteger(size) || size < 1 || size > 1000 || !Number.isInteger(page) || page < 1) { res.status(400).json({message:"حدود الصفحة غير صالحة"}); return; }
     const filter: Record<string, unknown> = { ...base };
     if (status) filter.status = status;
     const records = await AttendanceRecord.find(filter)
       .sort({ session_date: -1 })
-      .limit(Number(limit));
+      .skip((page - 1) * size).limit(size);
     res.json(records);
     return;
   }
 
   const m = Number(month);
   const y = Number(year);
-  if (isNaN(m) || isNaN(y)) {
+  if (!Number.isInteger(m) || !Number.isInteger(y)) {
     res.status(400).json({ message: "month و year مطلوبان" });
     return;
   }
@@ -136,11 +147,11 @@ export const validateCrossGroupScan = async (req: AuthRequest, res: Response): P
   }
 
   // Load student's original group
-  let studentGroup: { id: string; name: string; day_of_week: string; start_date?: string | null; grade_id?: string } | null = null;
+  let studentGroup: { id: string; name: string; day_of_week: string; start_date?: string | null; grade_id?: string; cancelled_sessions?:string[] } | null = null;
   if (student.group_id) {
     const grp = await Group.findOne({ _id: student.group_id, teacher_id: teacherId })
       .lean()
-      .select("_id name day_of_week start_date grade_id") as any;
+      .select("_id name day_of_week start_date grade_id cancelled_sessions") as any;
     if (grp) {
       studentGroup = {
         id: grp._id.toString(),
@@ -148,6 +159,7 @@ export const validateCrossGroupScan = async (req: AuthRequest, res: Response): P
         day_of_week: grp.day_of_week,
         start_date: grp.start_date || null,
         grade_id: grp.grade_id?.toString(),
+        cancelled_sessions: grp.cancelled_sessions,
       };
     }
   }
@@ -287,8 +299,11 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
 
   let prepared;
   try {
+    const groupIds = [...new Set([...students.map(s => String(s.group_id)), ...allowedRecords.map(r => String(r.scanner_group_id || r.group_id || ""))].filter(id => mongoose.isValidObjectId(id)))];
+    const groups = await Group.find({ _id: { $in: groupIds }, teacher_id: resolvedTeacherId || req.user!.id }).lean();
+    const groupMap = new Map(groups.map(g => [String(g._id), g]));
     const studentMap = new Map(students.map(s => [String(s._id), s]));
-    prepared = await Promise.all(allowedRecords.map(r => prepareAttendance(resolvedTeacherId || req.user!.id, studentMap.get(r.student_id), r)));
+    prepared = await Promise.all(allowedRecords.map(r => prepareAttendance(resolvedTeacherId || req.user!.id, studentMap.get(r.student_id), r, groupMap)));
   } catch (error) { res.status(400).json({ message: (error as Error).message }); return; }
   const ops = prepared.map((r) => ({
     updateOne: {
@@ -306,7 +321,8 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
     if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور سابق في مجموعة أخرى؛ لم يتم تغيير أي سجل" }); return; }
     throw error;
   }
-  res.status(201).json({ message: "تم الحفظ بنجاح", suspended_skipped: suspendedNames });
+  const data = prepared.length ? await AttendanceRecord.find({ teacher_id: resolvedTeacherId || req.user!.id, $or: prepared.map(r => ({student_id:r.student_id,session_date:r.session_date})) }) : [];
+  res.status(201).json({ message: "تم الحفظ بنجاح", data, suspended_skipped: suspendedNames });
 };
 
 export const getStudentAttendanceSummary = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -320,12 +336,16 @@ export const getStudentAttendanceSummary = async (req: AuthRequest, res: Respons
   const records = await AttendanceRecord.find({
     student_id: studentId,
     ...teacherFilter(req),
-  }).lean().select("status month year session_date") as any[];
+  }).lean().select("status month year session_date group_id") as any[];
+  const groupIds=[...new Set(records.map(r=>r.group_id).filter(Boolean))];
+  const groups=groupIds.length ? await Group.find({_id:{$in:groupIds}}).select("cancelled_sessions").lean() : [];
+  const cancelled=new Map(groups.map(g=>[String(g._id),new Set(g.cancelled_sessions||[])]));
 
 
 
   const map = new Map<string, { present: number; absent: number; month: number; year: number }>();
   for (const r of records) {
+    if(cancelled.get(String(r.group_id))?.has(r.session_date))continue;
     const key = `${r.year}-${r.month}`;
     const cur = map.get(key) ?? { present: 0, absent: 0, month: r.month, year: r.year };
     if (r.status === "present") cur.present++; else cur.absent++;
@@ -341,6 +361,7 @@ export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<
   const matchBase = toAggregationFilter(teacherFilter(req));
   const pipeline = [
     { $match: matchBase },
+    ...activeSessionStages,
     { $group: { _id: { student_id: "$student_id", status: "$status" }, count: { $sum: 1 } } },
     { $group: {
       _id: "$_id.student_id",
@@ -362,6 +383,11 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
   // خطوة 1: آخر session_date لكل group_id
   const lastSessionPipeline = [
     { $match: matchBase },
+    ...activeSessionStages,
+    {$match:{session_date:{$lte:new Date().toLocaleDateString("en-CA",{timeZone:"Africa/Cairo"})}}},
+    {$lookup:{from:AttendanceSession.collection.name,let:{gid:"$group_id",date:"$session_date"},pipeline:[{$match:{$expr:{$and:[{$eq:["$group_id","$$gid"]},{$eq:["$session_date","$$date"]}]}}}],as:"frozenSession"}},
+    {$addFields:{attendanceStartsAt:{$dateFromString:{dateString:{$concat:["$session_date","T",{$ifNull:[{$arrayElemAt:["$frozenSession.time",0]},{$ifNull:[{$arrayElemAt:["$attendanceGroup.time",0]},"23:59"]}]},":00"]},timezone:"Africa/Cairo",onError:null}}}},
+    {$match:{$expr:{$and:[{$ne:["$attendanceStartsAt",null]},{$lte:[{$add:["$attendanceStartsAt",3600000]},"$$NOW"]}]}}},
     { $group: { _id: "$group_id", lastDate: { $max: "$session_date" } } },
   ];
   const lastSessions = await AttendanceRecord.aggregate(lastSessionPipeline) as { _id: string; lastDate: string }[];
@@ -382,19 +408,31 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
 
   // خطوة 3: الطلاب لكل مجموعة
   const groupIds = lastSessions.map((s) => s._id).filter(Boolean);
-  const students = await Student.find({ group_id: { $in: groupIds }, ...base })
+  const memberships=await StudentMembership.find({group_id:{$in:groupIds},...base}).lean();
+  const groups=await Group.find({_id:{$in:groupIds},...base}).lean();
+  const frozen=await AttendanceSession.find({...base,$or:lastSessions.map(s=>({group_id:s._id,session_date:s.lastDate}))}).lean();
+  const frozenMap=new Map(frozen.map(s=>[`${s.group_id}|${s.session_date}`,s]));
+  const groupMap=new Map(groups.map(g=>[String(g._id),g]));
+  const students = await Student.find({$or:[{group_id:{$in:groupIds}},{_id:{$in:memberships.map(m=>m.student_id)}}], ...base })
     .lean()
-    .select("_id name code group_id group_join_date") as any[];
+    .select("_id name code group_id group_join_date created_at is_suspended suspended_until") as any[];
 
   const result: Record<string, { sessionDate: string; absentees: { id: string; name: string; code: string | null }[] }> = {};
   for (const { _id: groupId, lastDate } of lastSessions) {
     if (!groupId) continue;
     const key = String(groupId);
+    const originalGroup=groupMap.get(key);
+    const snapshot=frozenMap.get(`${key}|${lastDate}`);
+    const group=snapshot && originalGroup ? {...originalGroup,start_date:undefined,day_of_week:undefined,time:snapshot.time,cancelled_sessions:snapshot.cancelled?[lastDate]:[]} : originalGroup;
+    if(!group || !endedSession(group,lastDate))continue;
     const presentIds = presentMap.get(key) ?? new Set();
     const absentees = students
       .filter((s: any) => {
-        if (String(s.group_id) !== key) return false;
-        const joinDate = s.group_join_date ?? null;
+        const history=memberships.filter(m=>String(m.student_id)===String(s._id));
+        const membership=history.filter(m=>m.starts_on<=lastDate&&(!m.ends_on||m.ends_on>=lastDate)).sort((a,b)=>b.starts_on.localeCompare(a.starts_on))[0];
+        if (String(membership?.group_id || s.group_id) !== key) return false;
+        const joinDate = membership?.starts_on || s.group_join_date || s.created_at?.toISOString().slice(0,10) || null;
+        if(!eligibleForSession(group,{...s,group_join_date:joinDate},lastDate))return false;
         if (joinDate && joinDate > lastDate) return false;
         return !presentIds.has(String(s._id));
       })
@@ -419,10 +457,10 @@ export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<v
   }
 
   // Resolve effective teacher ID (supports assistant)
-  const effectiveTeacherId = req.user!.effective_teacher_id ?? req.user!.id;
-
-  const group = await Group.findOne({ _id: group_id, teacher_id: effectiveTeacherId }).lean() as any;
+  const group = await Group.findOne({ _id: group_id, ...teacherFilter(req) }).lean() as any;
   if (!group) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
+  const effectiveTeacherId = String(group.teacher_id);
+  if (!endedSession(group, session_date)) { res.status(400).json({message:"الجلسة غير صالحة أو ملغاة أو لم تنتهِ"}); return; }
 
   // تحقق أن ساعة مرت على وقت الحصة (بـ timezone المدرس)
   const teacherTz = (group as any).teacher_timezone || "Africa/Cairo";
@@ -433,11 +471,12 @@ export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<v
     return;
   }
 
-  const students = await Student.find({ group_id, teacher_id: effectiveTeacherId, is_suspended: { $ne: true } }).lean() as any[];
+  const students = await Student.find({ group_id, teacher_id: effectiveTeacherId }).lean() as any[];
   const existing = await AttendanceRecord.find({ group_id, session_date }).lean() as any[];
   const existingIds = new Set(existing.map((r: any) => String(r.student_id)));
 
   const toInsert = students
+    .filter(s => eligibleForSession(group, s, session_date))
     .filter((s: any) => !existingIds.has(String(s._id)))
     .filter((s: any) => {
       const joinDate = s.group_join_date || new Date(s.created_at).toISOString().slice(0, 10);
@@ -453,30 +492,28 @@ export const autoMarkAbsent = async (req: AuthRequest, res: Response): Promise<v
       status: "absent",
     }));
 
-  if (toInsert.length > 0) {
-    await AttendanceRecord.insertMany(toInsert, { ordered: false });
-  }
-
-  res.json({ marked: toInsert.length });
+  const saved=toInsert.length ? await AttendanceRecord.bulkWrite(toInsert.map(r => ({updateOne:{filter:{student_id:r.student_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}})) as any) : null;
+  res.json({ marked: saved?.upsertedCount || 0 });
 };
 
 // Batch auto-absent: مجموعة حصص في request واحد
 export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Promise<void> => {
-  const sessions = req.body.sessions as { group_id: string; session_date: string }[];
-  if (!Array.isArray(sessions) || sessions.length === 0) {
+  let sessions = req.body.sessions as { group_id: string; session_date: string }[];
+  if (!Array.isArray(sessions) || sessions.length === 0 || sessions.length > 1000 || sessions.some(s => !s || !mongoose.isValidObjectId(s.group_id) || !validAttendanceDate(s.session_date))) {
     res.status(400).json({ message: "sessions مطلوبة" });
     return;
   }
+  sessions = [...new Map(sessions.map(s => [`${s.group_id}|${s.session_date}`,s])).values()];
 
   const now = new Date();
   const groupIds = [...new Set(sessions.map((s) => s.group_id))];
-  const effectiveTeacherId = req.user!.effective_teacher_id ?? req.user!.id;
-  const groups = await Group.find({ _id: { $in: groupIds }, teacher_id: effectiveTeacherId }).lean() as any[];
+  const groups = await Group.find({ _id: { $in: groupIds }, ...teacherFilter(req) }).lean() as any[];
   const groupMap = new Map(groups.map((g) => [String(g._id), g]));
 
   const validSessions = sessions.filter(({ group_id, session_date }) => {
     const group = groupMap.get(group_id);
     if (!group) return false;
+    if (!endedSession(group, session_date, now)) return false;
     const teacherTz = (group as any).teacher_timezone || "Africa/Cairo";
     const threshold = buildLocalDate(session_date, group.time as string, teacherTz);
     threshold.setTime(threshold.getTime() + 60 * 60 * 1000);
@@ -487,7 +524,7 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
 
   // جلب كل الطلاب والسجلات بقواريين
   const [allStudents, existingRecords] = await Promise.all([
-    Student.find({ group_id: { $in: groupIds }, teacher_id: effectiveTeacherId, is_suspended: { $ne: true } }).lean() as any,
+    Student.find({ group_id: { $in: groupIds }, teacher_id: {$in:groups.map(g=>g.teacher_id)} }).lean() as any,
     AttendanceRecord.find({
       group_id: { $in: groupIds },
       session_date: { $in: [...new Set(validSessions.map((s) => s.session_date))] },
@@ -508,9 +545,10 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
     for (const s of groupStudents) {
       const key = `${String(s._id)}|${session_date}`;
       const joinDate = s.group_join_date || new Date(s.created_at).toISOString().slice(0, 10);
-      if (!existingSet.has(key) && joinDate <= session_date) {
+      if (!existingSet.has(key) && joinDate <= session_date && eligibleForSession(groupMap.get(group_id), s, session_date)) {
+        existingSet.add(key);
         toInsert.push({
-          student_id: s._id, group_id, teacher_id: effectiveTeacherId,
+          student_id: s._id, group_id, teacher_id: groupMap.get(group_id).teacher_id,
           session_date,
           month: parseInt(session_date.split("-")[1], 10),
           year: parseInt(session_date.split("-")[0], 10),
@@ -520,6 +558,6 @@ export const batchAutoMarkAbsent = async (req: AuthRequest, res: Response): Prom
     }
   }
 
-  if (toInsert.length > 0) await AttendanceRecord.insertMany(toInsert, { ordered: false });
-  res.json({ marked: toInsert.length });
+  const saved=toInsert.length ? await AttendanceRecord.bulkWrite((toInsert as any[]).map(r => ({updateOne:{filter:{student_id:r.student_id,session_date:r.session_date},update:{$setOnInsert:r},upsert:true}}))) : null;
+  res.json({ marked: saved?.upsertedCount || 0 });
 };

@@ -309,6 +309,8 @@ async function repriceGroupSubscriptions(groupIds: string[], scope: Record<strin
       if (ops.length) await MonthlySubscription.bulkWrite(ops);
 }
 
+import {freezeAttendanceSchedule} from "../services/attendanceSessions";
+import {AttendanceSession} from "../models/AttendanceSession";
 export const updateGroup = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const validation = groupValidationError(req.body, true);
@@ -332,6 +334,7 @@ export const updateGroup = atomicController(async (req: AuthRequest, res: Respon
     if (!owner) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
     if (!await validateOwnedReferences(String(owner.teacher_id), allowedUpdate)) { res.status(403).json({ message: "مرجع غير مصرح" }); return; }
     if ("grade_id" in allowedUpdate && String(allowedUpdate.grade_id || "") !== String(owner.grade_id || "") && await Student.exists({group_id:owner._id,...teacherFilter(req)})) {res.status(409).json({message:"لا يمكن تغيير صف مجموعة تضم طلابًا"});return;}
+    if (["day_of_week","time","start_date"].some(key => key in allowedUpdate)) await freezeAttendanceSchedule(owner);
     const oldGroup = await Group.findOneAndUpdate(
       { _id: req.params.id, ...teacherFilter(req) },
       { $set: allowedUpdate },
@@ -381,6 +384,7 @@ export const toggleCancelSession = atomicController(async (req: AuthRequest, res
     const updated = cancelled.includes(date)
       ? cancelled.filter((d: string) => d !== date)
       : [...cancelled, date];
+    await AttendanceSession.updateOne({group_id:group._id,session_date:date},{$set:{cancelled:updated.includes(date)},$setOnInsert:{teacher_id:group.teacher_id,group_id:group._id,session_date:date,time:group.time}},{upsert:true});
     group.cancelled_sessions = updated;
     await group.save();
     res.json(group);

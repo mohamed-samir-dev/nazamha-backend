@@ -233,7 +233,7 @@ describe("attendance input validation", () => {
     await expect(prepareAttendance(A, { _id: S, group_id: G }, { session_date, status: "present" })).rejects.toThrow();
   });
   test("date determines month/year and original group", async () => {
-    jest.spyOn(Group, "findOne").mockReturnValue(chain({ _id: G, day_of_week: "السبت", name: "Test" }));
+    jest.spyOn(Group, "findOne").mockReturnValue(chain({ _id: G, day_of_week: "الأربعاء", name: "Test" }));
     const record = await prepareAttendance(A, { _id: S, group_id: G }, { session_date: "2025-01-01", status: "present", month: 7, year: 2099 });
     expect(record).toMatchObject({ month: 1, year: 2025, group_id: G, teacher_id: A });
   });

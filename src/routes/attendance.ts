@@ -4,7 +4,9 @@ import { protect } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
 
 const router = Router();
+import { attendanceContext } from "../controllers/attendanceContextController";
 router.use(protect);
+router.get("/context", asyncHandler(attendanceContext));
 
 router.get("/", asyncHandler(getAttendance));
 router.get("/all-time-stats", asyncHandler(getAllTimeStats));
