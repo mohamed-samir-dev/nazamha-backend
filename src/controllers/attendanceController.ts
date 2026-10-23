@@ -11,6 +11,8 @@ import { endedSession, validAttendanceDate } from "../utils/attendanceSession";
 import { eligibleForSession } from "../utils/sessionEligibility";
 import {StudentMembership} from "../models/StudentMembership";
 import {AttendanceSession} from "../models/AttendanceSession";
+import {commitCrossGroupAttendance,verifyAttendanceQR,invalidateSubstitutions} from "../services/crossGroupAttendance";
+import {substitutionError} from "./attendanceSubstitutionController";
 const activeSessionStages = [
   {$lookup:{from:"groups",localField:"group_id",foreignField:"_id",as:"attendanceGroup"}},
   {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$attendanceGroup.cancelled_sessions",0]},[]]}]}]}}},
@@ -227,12 +229,20 @@ export const upsertAttendance = async (req: AuthRequest, res: Response): Promise
   // Check ownership: student must belong to this teacher
   const student = await Student.findOne({ _id: req.body.student_id, teacher_id: teacherId })
     .lean()
-    .select("_id group_id grade_id group_join_date created_at is_suspended suspended_until suspension_reason") as any;
+    .select("_id teacher_id card_qr_version group_id grade_id group_join_date created_at is_suspended suspended_until suspension_reason") as any;
   if (!student) {
     res.status(403).json({ message: "ليس لديك صلاحية لتسجيل حضور هذا الطالب" }); return;
   }
 
   let record;
+  if(req.body.scanner_group_id && String(req.body.scanner_group_id)!==String(student.group_id)) {
+    try {
+      const outcome=await commitCrossGroupAttendance(teacherId,{student_id:String(student._id),scanner_group_id:req.body.scanner_group_id,requested_date:req.body.session_date,qr_text:req.body.qr_text,action:req.body.cross_group_action,target_date:req.body.target_date,reason:req.body.reason},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type});
+      const data=typeof outcome.record.toJSON==="function"?outcome.record.toJSON():{...outcome.record,id:String(outcome.record._id)};
+      res.status(outcome.duplicate?200:201).json({...data,cross_group_action:req.body.cross_group_action,substitution_id:outcome.substitution?String(outcome.substitution._id):undefined,duplicate:outcome.duplicate});return;
+    }catch(error){if(substitutionError(res,error))return;throw error;}
+  }
+  try{await verifyAttendanceQR(teacherId,student,req.body.qr_text);}catch(error){if(substitutionError(res,error))return;throw error;}
   try { record = await prepareAttendance(teacherId, student, req.body); }
   catch (error) { res.status(400).json({ message: (error as Error).message }); return; }
 
@@ -321,7 +331,7 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
     if (error?.code === 11000) { res.status(409).json({ message: "يوجد حضور سابق في مجموعة أخرى؛ لم يتم تغيير أي سجل" }); return; }
     throw error;
   }
-  const data = prepared.length ? await AttendanceRecord.find({ teacher_id: resolvedTeacherId || req.user!.id, $or: prepared.map(r => ({student_id:r.student_id,session_date:r.session_date})) }) : [];
+  const data = prepared.length ? await AttendanceRecord.find({ teacher_id: resolvedTeacherId || req.user!.id, $or: prepared.map(r => ({student_id:r.student_id,group_id:r.group_id,session_date:r.session_date})) }) : [];
   res.status(201).json({ message: "تم الحفظ بنجاح", data, suspended_skipped: suspendedNames });
 };
 
