@@ -1,6 +1,10 @@
 import mongoose, { Schema, Document } from "mongoose";
 
 export interface IAttendanceRecord extends Document {
+  attendance_kind?: "regular" | "guest" | "substitute";
+  original_group_id?: mongoose.Types.ObjectId;
+  session_id?: mongoose.Types.ObjectId;
+  attendance_revision?: number;
   scanner_group_id?: mongoose.Types.ObjectId | null;
   scanner_session_date?: string;
   student_id: mongoose.Types.ObjectId;
@@ -15,6 +19,10 @@ export interface IAttendanceRecord extends Document {
 
 const AttendanceRecordSchema = new Schema<IAttendanceRecord>(
   {
+    attendance_kind:{type:String,enum:["regular","guest","substitute"],default:"regular"},
+    original_group_id:{type:Schema.Types.ObjectId,ref:"Group"},
+    session_id:{type:Schema.Types.ObjectId,ref:"AttendanceSession"},
+    attendance_revision:{type:Number,default:0},
     scanner_group_id: {type: Schema.Types.ObjectId, ref:"Group", default:null},
     scanner_session_date: {type:String},
     student_id: { type: Schema.Types.ObjectId, ref: "Student", required: true },
@@ -35,7 +43,7 @@ const AttendanceRecordSchema = new Schema<IAttendanceRecord>(
 );
 
 // unique constraint: one record per student per session date
-AttendanceRecordSchema.index({ student_id: 1, session_date: 1 }, { unique: true });
+AttendanceRecordSchema.index({ student_id: 1, group_id:1, session_date: 1 }, { unique: true });
 AttendanceRecordSchema.index({ teacher_id: 1, month: 1, year: 1 });
 // all-time-stats aggregation + last-session-absentees: teacher + student + status
 AttendanceRecordSchema.index({ teacher_id: 1, student_id: 1, status: 1 });
