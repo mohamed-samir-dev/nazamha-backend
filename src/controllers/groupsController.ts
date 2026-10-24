@@ -377,14 +377,14 @@ export const toggleCancelSession = atomicController(async (req: AuthRequest, res
   try {
     const { date } = req.body;
     if (!validCalendarDate(date)) { res.status(400).json({ message: "التاريخ غير صحيح" }); return; }
+    if(req.body.cancelled !== undefined && typeof req.body.cancelled !== "boolean"){res.status(400).json({message:"حالة الحصة غير صالحة"});return;}
     const group = await Group.findOne({ _id: req.params.id, ...teacherFilter(req) });
     if (!group) { res.status(404).json({ message: "المجموعة غير موجودة" }); return; }
 
 
     const cancelled = group.cancelled_sessions ?? [];
-    const updated = cancelled.includes(date)
-      ? cancelled.filter((d: string) => d !== date)
-      : [...cancelled, date];
+    const shouldCancel = req.body.cancelled ?? !cancelled.includes(date);
+    const updated = shouldCancel ? [...new Set([...cancelled,date])] : cancelled.filter((d: string) => d !== date);
     await AttendanceSession.updateOne({group_id:group._id,session_date:date},{$set:{cancelled:updated.includes(date)},$setOnInsert:{teacher_id:group.teacher_id,group_id:group._id,session_date:date,time:group.time}},{upsert:true});
     group.cancelled_sessions = updated;
     if(updated.includes(date)) await invalidateSubstitutions({teacher_id:group.teacher_id,$or:[{actual_group_id:group._id,actual_date:date},{target_group_id:group._id,target_date:date}]},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"إلغاء حصة مرتبطة بالتعويض أو الإعفاء؛ يلزم مراجعة");

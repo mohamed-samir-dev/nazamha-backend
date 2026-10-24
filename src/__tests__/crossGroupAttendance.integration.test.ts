@@ -160,3 +160,9 @@ test("migration dry run preserves the old index; apply replaces it without chang
  const indexes=await AttendanceRecord.collection.indexes();expect(indexes.some(i=>i.name==="student_id_1_session_date_1")).toBe(false);expect(indexes.some(i=>i.key.student_id===1&&i.key.group_id===1&&i.key.session_date===1&&i.unique)).toBe(true);
  const after=await AttendanceRecord.findById(before!._id).lean();expect(after).toEqual(before);
 });
+
+test("explicit cancellation state is idempotent across repeated requests",async()=>{
+ const first=response();await toggleCancelSession(request({date:current,cancelled:true},{id:String(D)}),first);expect(first.statusCode).toBe(200);
+ const again=response();await toggleCancelSession(request({date:current,cancelled:true},{id:String(D)}),again);expect(again.statusCode).toBe(200);expect((await Group.findById(D))!.cancelled_sessions).toEqual([current]);
+ const restore=response();await toggleCancelSession(request({date:current,cancelled:false},{id:String(D)}),restore);expect((await Group.findById(D))!.cancelled_sessions).toEqual([]);expect((await AttendanceSession.findOne({group_id:D,session_date:current}))!.cancelled).toBe(false);
+});
