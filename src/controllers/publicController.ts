@@ -48,10 +48,12 @@ export const getPublicStudentReport = async (req: Request, res: Response): Promi
   const groupIds = attendanceMemberships.map(m => (m.group_id as any)?._id ?? m.group_id).filter(Boolean);
   const sessions = groupIds.length ? await AttendanceRecord.aggregate([
     { $match: { teacher_id: student.teacher_id, group_id: { $in: groupIds }, month, year, session_date: { $gte: start, $lte: end, $lt: today } } },
+    {$lookup:{from:Group.collection.name,localField:"group_id",foreignField:"_id",as:"sessionGroup"}},
+    {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$sessionGroup.cancelled_sessions",0]},[]]}]}]}}},
     { $group: { _id: { group_id: "$group_id", date: "$session_date" } } },
   ]) : [];
   const resolutions=await effectiveResolutions({...scope,target_date:{$gte:start,$lte:end}});
-  const merged=mergeAttendanceResolutions(attendanceRecords,resolutions).map(r=>({...r,group_id:attendanceMemberships.find(m=>String((m.group_id as any)?._id || m.group_id)===String(r.group_id?._id || r.group_id))?.group_id || r.group_id}));
+  const merged=mergeAttendanceResolutions(attendanceRecords.filter(r=>!(r.group_id as any)?.cancelled_sessions?.includes(r.session_date)),resolutions).map(r=>({...r,group_id:attendanceMemberships.find(m=>String((m.group_id as any)?._id || m.group_id)===String(r.group_id?._id || r.group_id))?.group_id || r.group_id}));
   const attendance = reportAttendance(merged.filter(r=>!r.group_id?.cancelled_sessions?.includes(r.session_date)), attendanceMemberships as any, sessions, today);
   const subscription = subscriptions.find(s => s.month === month && s.year === year);
   const exams = examGrades.filter((row: any) => row.exam_id && row.exam_id.exam_date <= end).map((row: any) => ({ title: row.exam_id.title, date: row.exam_id.exam_date, score: row.score, max_score: row.exam_id.max_score })).sort((a, b) => b.date.localeCompare(a.date));

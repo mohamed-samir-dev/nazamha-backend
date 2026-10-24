@@ -2,6 +2,7 @@ import mongoose, {ClientSession} from "mongoose";
 import {Student} from "../models/Student";
 import {Group} from "../models/Group";
 import {Teacher} from "../models/Teacher";
+import {SubTeacher} from "../models/SubTeacher";
 import {StudentMembership} from "../models/StudentMembership";
 import {AttendanceRecord} from "../models/AttendanceRecord";
 import {AttendanceSession} from "../models/AttendanceSession";
@@ -61,6 +62,12 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
  // must also agree. A shared grade across different teachers never grants access.
  if(!original.grade_id||!destination.grade_id||id(original.grade_id)!==id(destination.grade_id)||(student.grade_id&&id(student.grade_id)!==id(original.grade_id)))fail("المجموعتان غير متوافقتين في الصف الدراسي",403);
  if(id(original.sub_teacher_id)!==id(destination.sub_teacher_id))fail("المجموعتان تتبعان مسارين تدريسيين مختلفين",403);
+ let subject=teacher.subject || "مادة المدرس";
+ if(original.sub_teacher_id){
+   const courseOwner=await read(SubTeacher.findOne({_id:original.sub_teacher_id,center_id:teacherId}),session);
+   if(!courseOwner||(courseOwner.grade_ids?.length&&!courseOwner.grade_ids.some((grade:unknown)=>id(grade)===id(original.grade_id))))fail("المدرس الفرعي أو نطاق الصف غير متاح لهاتين المجموعتين",403);
+   subject=courseOwner.subject || subject;
+ }
  checkAcademicDate(teacher,input.requested_date);
  const today=getTodayInTimezone(),lower=new Date(today+"T12:00:00Z");lower.setUTCDate(lower.getUTCDate()-90);
  const upper=new Date(today+"T12:00:00Z");upper.setUTCDate(upper.getUTCDate()+56);
@@ -77,7 +84,7 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
  // Match the existing attendance window: five minutes before, one hour after.
  const actualOpen=input.requested_date===today&&now.getTime()>=starts.getTime()-5*60000&&now.getTime()<starts.getTime()+3600000;
  if(!actualOpen&&!allowClosed)fail("الحصة ليست مفتوحة الآن للحضور خارج المجموعة",400);
- const joined=student.group_join_date || student.created_at?.toISOString().slice(0,10);
+ const joined=student.group_join_date || (student.created_at?new Date(student.created_at).toLocaleDateString("en-CA",{timeZone:"Africa/Cairo"}):undefined);
  if(joined&&input.requested_date<joined)fail("لا يمكن تسجيل الحضور قبل انضمام الطالب",400);
  const enrolled=(date:string)=>{
    const membership=memberships.find((m:any)=>m.starts_on<=date&&(!m.ends_on||m.ends_on>=date));
@@ -95,7 +102,7 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
    const covered=substitutions.some((s:any)=>s.target_date===date&&id(s.target_group_id)===id(original._id));
    if(covered||record?.status==="present")continue;
    const start=buildLocalDate(date,lesson.time);
-   const option:LessonOption={...lesson,group_id:id(original._id),group_name:original.name,subject:teacher.subject || "مادة المدرس",status:record?.status || "unrecorded"};
+   const option:LessonOption={...lesson,group_id:id(original._id),group_name:original.name,subject,status:record?.status || "unrecorded"};
    if(start.getTime()+3600000<=now.getTime()&&record?.status==="absent")previous.push(option);
    else if(start>now)future.push(option);
  }

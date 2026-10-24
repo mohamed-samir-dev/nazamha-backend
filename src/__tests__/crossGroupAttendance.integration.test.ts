@@ -5,6 +5,7 @@ import {MongoMemoryReplSet} from "mongodb-memory-server";
 import {Student} from "../models/Student";
 import {Group} from "../models/Group";
 import {Teacher} from "../models/Teacher";
+import {SubTeacher} from "../models/SubTeacher";
 import {AttendanceRecord} from "../models/AttendanceRecord";
 import {AttendanceSession} from "../models/AttendanceSession";
 import {AttendanceSubstitution} from "../models/AttendanceSubstitution";
@@ -110,4 +111,38 @@ test("normal same-group QR attendance remains automatic and repeated scans stay 
 });
 test("the database permits two actual groups on one day but forbids duplicate student/lesson",async()=>{
  await commitCrossGroupAttendance(String(T),input({action:"guest"}),actor);const base={student_id:S,teacher_id:T,group_id:G,session_date:current,month:10,year:2026,status:"present"};await AttendanceRecord.create(base);await expect(AttendanceRecord.create(base)).rejects.toMatchObject({code:11000});expect(await AttendanceRecord.countDocuments({student_id:S,session_date:current})).toBe(2);
+});
+test("another student's absence never makes this student's target eligible",async()=>{
+ const other=await Student.create({teacher_id:T,group_id:G,grade_id:GRADE,name:"طالب آخر",code:"A-2"});
+ await AttendanceRecord.create({teacher_id:T,student_id:other._id,group_id:G,session_date:"2026-10-17",month:10,year:2026,status:"absent"});
+ await expect(commitCrossGroupAttendance(String(T),input({action:"compensate",target_date:"2026-10-17"}),actor)).rejects.toThrow("مؤهلة");
+});
+test("future membership end excludes lessons after enrollment ends",async()=>{
+ await StudentMembership.create({teacher_id:T,student_id:S,group_id:G,grade_id:GRADE,starts_on:"2026-09-01",ends_on:"2026-10-30"});
+ const result=await crossGroupEligibility(String(T),input());expect(result.future.some(l=>l.date===future)).toBe(false);
+});
+test("a closed actual window allows history review but never commits attendance",async()=>{
+ jest.setSystemTime(new Date("2026-10-26T15:00:00Z"));
+ expect((await crossGroupEligibility(String(T),input())).canRecord).toBe(false);
+ await expect(commitCrossGroupAttendance(String(T),input({action:"guest"}),actor)).rejects.toThrow("مفتوحة");
+ expect(await AttendanceRecord.countDocuments({group_id:D})).toBe(0);
+});
+test("cancelling the exempted lesson marks the relation for review without deleting actual attendance",async()=>{
+ await commitCrossGroupAttendance(String(T),input({action:"exempt",target_date:future}),actor);
+ const res=response();await toggleCancelSession(request({date:future},{id:String(G)}),res);
+ expect(res.statusCode).toBe(200);expect((await AttendanceSubstitution.findOne())!.state).toBe("review");expect(await AttendanceRecord.countDocuments({group_id:D,status:"present"})).toBe(1);
+});
+test("unsupported transactions fail safely instead of performing partial writes",async()=>{
+ jest.spyOn(mongoose.connection,"transaction").mockRejectedValueOnce(Object.assign(new Error("standalone"),{code:20}));
+ await expect(commitCrossGroupAttendance(String(T),input({action:"guest"}),actor)).rejects.toMatchObject({status:503});expect(await AttendanceRecord.countDocuments({group_id:D})).toBe(0);
+});
+test("delegated groups resolve the actual subteacher subject instead of the center subject",async()=>{
+ const delegated=await SubTeacher.create({center_id:T,name:"مدرس فرعي",subject:"الكيمياء",grade_ids:[GRADE]});
+ await Group.updateMany({_id:{$in:[G,D]}},{$set:{sub_teacher_id:delegated._id}});
+ const result=await crossGroupEligibility(String(T),input());expect(result.previous[0].subject).toBe("الكيمياء");
+});
+test("a delegated course belonging to another account is rejected",async()=>{
+ const delegated=await SubTeacher.create({center_id:OTHER,name:"مدرس آخر",subject:"الكيمياء",grade_ids:[GRADE]});
+ await Group.updateMany({_id:{$in:[G,D]}},{$set:{sub_teacher_id:delegated._id}});
+ await expect(crossGroupEligibility(String(T),input())).rejects.toThrow("المدرس الفرعي");
 });
