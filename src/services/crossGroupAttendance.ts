@@ -47,7 +47,7 @@ export function resolveLesson(group:any,date:string,snapshots:any[]){
  return {date,time:saved?.time || group.time,session_id:saved? id(saved._id):undefined};
 }
 
-async function loadContext(teacherId:string,input:CrossGroupInput,session?:ClientSession,allowClosed=false){
+async function loadContext(teacherId:string,input:CrossGroupInput,session?:ClientSession){
  if(!validAttendanceId(teacherId)||!validAttendanceId(input.student_id)||!validAttendanceId(input.scanner_group_id)||!validAttendanceDate(input.requested_date))fail("معرّف الطالب أو المجموعة أو تاريخ الحصة غير صالح",400);
  const student=await read(Student.findOne({_id:input.student_id,teacher_id:teacherId}),session);
  if(!student)fail("الطالب غير متاح في حساب المدرس",403);
@@ -73,17 +73,18 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
  const upper=new Date(today+"T12:00:00Z");upper.setUTCDate(upper.getUTCDate()+56);
  const from=lower.toISOString().slice(0,10),to=upper.toISOString().slice(0,10);
  const [snapshots,memberships,records,substitutions]=await (session?series:Promise.all.bind(Promise))([
-   read(AttendanceSession.find({teacher_id:teacherId,group_id:{$in:[original._id,destination._id]},session_date:{$gte:from,$lte:to}}),session),
+   read(AttendanceSession.find({teacher_id:teacherId,group_id:{$in:[original._id,destination._id]},$or:[{session_date:{$gte:from,$lte:to}},{session_date:input.requested_date}]}),session),
    read(StudentMembership.find({teacher_id:teacherId,student_id:student._id}).sort({starts_on:-1}),session),
-   read(AttendanceRecord.find({teacher_id:teacherId,student_id:student._id,session_date:{$gte:from,$lte:to}}),session),
+   read(AttendanceRecord.find({teacher_id:teacherId,student_id:student._id,$or:[{session_date:{$gte:from,$lte:to}},{session_date:input.requested_date}]}),session),
    read(AttendanceSubstitution.find({teacher_id:teacherId,student_id:student._id,active:true}),session),
  ]);
  const actual=resolveLesson(destination,input.requested_date,snapshots);
  if(!actual)fail("الحصة الحالية ملغاة أو غير موجودة في الجدول",400);
  const now=new Date(),starts=buildLocalDate(actual.date,actual.time);
- // Match the existing attendance window: five minutes before, one hour after.
- const actualOpen=input.requested_date===today&&now.getTime()>=starts.getTime()-5*60000&&now.getTime()<starts.getTime()+3600000;
- if(!actualOpen&&!allowClosed)fail("الحصة ليست مفتوحة الآن للحضور خارج المجموعة",400);
+ // This product has no explicit open/closed lesson state. Selecting a valid
+ // scheduled date authorizes attendance, just like the ordinary attendance flow.
+ // Finalizing automatic absence after an hour does not close attendance.
+ const actualOpen=true;
  const joined=student.group_join_date || (student.created_at?new Date(student.created_at).toLocaleDateString("en-CA",{timeZone:"Africa/Cairo"}):undefined);
  if(joined&&input.requested_date<joined)fail("لا يمكن تسجيل الحضور قبل انضمام الطالب",400);
  const enrolled=(date:string)=>{
@@ -103,7 +104,7 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
    if(covered||record?.status==="present")continue;
    const start=buildLocalDate(date,lesson.time);
    const option:LessonOption={...lesson,group_id:id(original._id),group_name:original.name,subject,status:record?.status || "unrecorded"};
-   if(start.getTime()+3600000<=now.getTime()&&record?.status==="absent")previous.push(option);
+   if(start.getTime()+3600000<=now.getTime()&&start<starts&&record?.status==="absent")previous.push(option);
    else if(start>now)future.push(option);
  }
  const existing=records.find((r:any)=>((id(r.group_id)===id(destination._id)&&r.session_date===input.requested_date)||(id(r.scanner_group_id)===id(destination._id)&&r.scanner_session_date===input.requested_date))&&r.status==="present");
@@ -111,7 +112,7 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
 }
 
 export async function crossGroupEligibility(teacherId:string,input:CrossGroupInput){
- const c=await loadContext(teacherId,input,undefined,true);
+ const c=await loadContext(teacherId,input);
  await verifyAttendanceQR(teacherId,c.student,input.qr_text);
  return {decision:"confirm" as const,reason:"اختر حضورًا كضيف فقط، أو تعويض غياب سابق، أو إعفاء حصة قادمة. لا يتغير انضمام الطالب لمجموعته.",studentGroupId:id(c.original._id),studentGroupName:c.original.name,studentGroupSchedule:c.original.day_of_week,destinationGroupName:c.destination.name,actualLesson:{date:c.actual.date,time:c.actual.time,group_id:id(c.destination._id)},alreadyPresent:!!c.existing,canRecord:c.actualOpen,attendanceUnavailable:c.actualOpen?undefined:"الحصة غير مفتوحة الآن. يمكن مراجعة التعويضات والتراجع عنها فقط.",previous:c.previous,future:c.future,previousUnavailable:"لا يوجد غياب سابق مؤهل خلال آخر 90 يومًا في الشهور الدراسية المفعلة.",futureUnavailable:"لا توجد حصة قادمة مؤهلة خلال 8 أسابيع في الشهور الدراسية المفعلة.",nextScheduledDate:null,scheduledDateIsToday:false,scheduledDateIsFuture:false,scheduledDateInCurrentWeek:false,scheduledDateInNextWeek:false};
 }
@@ -142,8 +143,7 @@ export async function commitCrossGroupAttendance(teacherId:string,input:CrossGro
    }
    const option=input.action==="compensate"?c.previous.find(l=>l.date===input.target_date):input.action==="exempt"?c.future.find(l=>l.date===input.target_date):null;
    if(input.action!=="guest"&&!option)fail("الحصة المختارة لم تعد مؤهلة للتعويض أو الإعفاء؛ أعد تحميل الخيارات");
-   const commitTime=Date.now(),actualStarts=buildLocalDate(c.actual.date,c.actual.time).getTime();
-   if(commitTime<actualStarts-5*60000||commitTime>=actualStarts+3600000)fail("انتهت نافذة حضور الحصة أثناء المراجعة؛ أعد التحميل");
+   const commitTime=Date.now();
    if(option&&input.action==="exempt"&&buildLocalDate(option.date,option.time).getTime()<=commitTime)fail("بدأت الحصة المختارة ولم تعد مؤهلة للإعفاء");
    const actualSession=await ensureSession(teacherId,c.destination,c.actual.date,c.actual.time,session);
    const record=await AttendanceRecord.findOneAndUpdate({teacher_id:teacherId,student_id:c.student._id,group_id:c.destination._id,session_date:c.actual.date},{$set:{status:"present",attendance_kind:input.action==="guest"?"guest":"substitute",original_group_id:c.original._id,session_id:actualSession._id,scanner_group_id:c.destination._id,scanner_session_date:c.actual.date,month:Number(c.actual.date.slice(5,7)),year:Number(c.actual.date.slice(0,4))},$inc:{attendance_revision:1}},{upsert:true,new:true,runValidators:true,session});

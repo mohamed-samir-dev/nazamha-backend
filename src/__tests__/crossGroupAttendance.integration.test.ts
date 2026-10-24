@@ -1,6 +1,7 @@
 import mongoose from "mongoose";
 import os from "os";
 import path from "path";
+import {spawnSync} from "child_process";
 import {MongoMemoryReplSet} from "mongodb-memory-server";
 import {Student} from "../models/Student";
 import {Group} from "../models/Group";
@@ -121,11 +122,15 @@ test("future membership end excludes lessons after enrollment ends",async()=>{
  await StudentMembership.create({teacher_id:T,student_id:S,group_id:G,grade_id:GRADE,starts_on:"2026-09-01",ends_on:"2026-10-30"});
  const result=await crossGroupEligibility(String(T),input());expect(result.future.some(l=>l.date===future)).toBe(false);
 });
-test("a closed actual window allows history review but never commits attendance",async()=>{
- jest.setSystemTime(new Date("2026-10-26T15:00:00Z"));
- expect((await crossGroupEligibility(String(T),input())).canRecord).toBe(false);
- await expect(commitCrossGroupAttendance(String(T),input({action:"guest"}),actor)).rejects.toThrow("مفتوحة");
- expect(await AttendanceRecord.countDocuments({group_id:D})).toBe(0);
+test("cross-group attendance after the scheduled hour follows the normal selected-session workflow",async()=>{
+ jest.setSystemTime(new Date("2026-10-26T15:10:00Z"));
+ expect((await crossGroupEligibility(String(T),input())).canRecord).toBe(true);
+ const result=await commitCrossGroupAttendance(String(T),input({action:"guest"}),actor);
+ expect(result.record.session_date).toBe(current);expect(await AttendanceRecord.countDocuments({group_id:D})).toBe(1);
+});
+test("an explicitly selected historical session records the actual historical date without an invented time window",async()=>{
+ const result=await commitCrossGroupAttendance(String(T),input({action:"guest",requested_date:"2026-10-19"}),actor);
+ expect(result.record.session_date).toBe("2026-10-19");expect(String(result.record.group_id)).toBe(String(D));
 });
 test("cancelling the exempted lesson marks the relation for review without deleting actual attendance",async()=>{
  await commitCrossGroupAttendance(String(T),input({action:"exempt",target_date:future}),actor);
@@ -145,4 +150,13 @@ test("a delegated course belonging to another account is rejected",async()=>{
  const delegated=await SubTeacher.create({center_id:OTHER,name:"مدرس آخر",subject:"الكيمياء",grade_ids:[GRADE]});
  await Group.updateMany({_id:{$in:[G,D]}},{$set:{sub_teacher_id:delegated._id}});
  await expect(crossGroupEligibility(String(T),input())).rejects.toThrow("المدرس الفرعي");
+});
+test("migration dry run preserves the old index; apply replaces it without changing attendance history",async()=>{
+ await AttendanceRecord.collection.createIndex({student_id:1,session_date:1},{unique:true});
+ const before=await AttendanceRecord.findOne({student_id:S,group_id:G}).lean();
+ const run=(apply:boolean)=>spawnSync(process.execPath,[path.resolve(__dirname,"../../node_modules/ts-node/dist/bin.js"),"--transpile-only",path.resolve(__dirname,"../../scripts/migrate-cross-group-attendance.ts"),...(apply?["--apply"]:[])],{cwd:path.resolve(__dirname,"../.."),env:{...process.env,MONGODB_URI:server.getUri("cross_group_attendance_test")},encoding:"utf8",timeout:30000});
+ const dry=run(false);expect(dry.status).toBe(0);expect((await AttendanceRecord.collection.indexes()).some(i=>i.name==="student_id_1_session_date_1")).toBe(true);
+ const applied=run(true);expect({status:applied.status,error:applied.stderr}).toMatchObject({status:0});
+ const indexes=await AttendanceRecord.collection.indexes();expect(indexes.some(i=>i.name==="student_id_1_session_date_1")).toBe(false);expect(indexes.some(i=>i.key.student_id===1&&i.key.group_id===1&&i.key.session_date===1&&i.unique)).toBe(true);
+ const after=await AttendanceRecord.findById(before!._id).lean();expect(after).toEqual(before);
 });

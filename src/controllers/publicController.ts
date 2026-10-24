@@ -119,7 +119,7 @@ export const getPublicCenterStudentReport = async (req: Request, res: Response):
   const [teachers, grades, groups, attendanceRecords, subscriptions, settings] = await Promise.all([
     Teacher.find({ _id: { $in: teacherIds } }).select("_id name subject").lean() as Promise<any[]>,
     gradeIds.length ? Grade.find({ _id: { $in: gradeIds } }).select("_id name").lean() as Promise<any[]> : Promise.resolve([]),
-    groupIds.length ? Group.find({ _id: { $in: groupIds } }).select("_id name day_of_week time").lean() as Promise<any[]> : Promise.resolve([]),
+    groupIds.length ? Group.find({ _id: { $in: groupIds },teacher_id:{$in:teacherIds} }).select("_id name day_of_week time cancelled_sessions").lean() as Promise<any[]> : Promise.resolve([]),
     AttendanceRecord.find({ student_id: { $in: studentIds }, month, year }).lean() as Promise<any[]>,
     MonthlySubscription.find({ student_id: { $in: studentIds }, month, year }).lean() as Promise<any[]>,
     SystemSettings.findOne().lean() as Promise<any>,
@@ -127,10 +127,14 @@ export const getPublicCenterStudentReport = async (req: Request, res: Response):
 
   const teacherMap = new Map(teachers.map((t: any) => [String(t._id), t]));
   const gradeMap = new Map((grades as any[]).map((g: any) => [String(g._id), g.name]));
-  const groupMap = new Map((groups as any[]).map((g: any) => [String(g._id), g]));
+  const knownGroups=new Set((groups as any[]).map(g=>String(g._id)));
+  const historicalGroupIds=[...new Set(attendanceRecords.map(r=>String(r.group_id)).filter(id=>id!=="null"&&!knownGroups.has(id)))];
+  const historicalGroups=historicalGroupIds.length?await Group.find({_id:{$in:historicalGroupIds},teacher_id:{$in:teacherIds}}).select("_id name cancelled_sessions").lean():[];
+  const groupMap = new Map([...groups,...historicalGroups].map((g: any) => [String(g._id), g]));
   const centerResolutions=await effectiveResolutions({student_id:{$in:studentIds},target_date:{$gte:`${year}-${String(month).padStart(2,"0")}-01`,$lte:`${year}-${String(month).padStart(2,"0")}-31`}});
   const attendanceByStudent = new Map<string, any[]>();
   for (const r of mergeAttendanceResolutions(attendanceRecords,centerResolutions)) {
+    if(groupMap.get(String(r.group_id))?.cancelled_sessions?.includes(r.session_date))continue;
     const key = String(r.student_id);
     if (!attendanceByStudent.has(key)) attendanceByStudent.set(key, []);
     attendanceByStudent.get(key)!.push(r);
@@ -156,6 +160,9 @@ export const getPublicCenterStudentReport = async (req: Request, res: Response):
       group_time: group?.time ?? "",
       attendance_present: presentCount,
       attendance_absent: absentCount,
+      attendance_compensated:records.filter(r=>r.resolution==="compensated").length,
+      attendance_exempt:records.filter(r=>r.resolution==="exempt").length,
+      attendance_guest:records.filter(r=>r.status==="present"&&["guest","substitute"].includes(r.attendance_kind)).length,
       attendance_total: presentCount + absentCount,
       isPaid,
     };
