@@ -126,8 +126,9 @@ export const getPublicCenterStudentReport = async (req: Request, res: Response):
   const teacherMap = new Map(teachers.map((t: any) => [String(t._id), t]));
   const gradeMap = new Map((grades as any[]).map((g: any) => [String(g._id), g.name]));
   const groupMap = new Map((groups as any[]).map((g: any) => [String(g._id), g]));
+  const centerResolutions=await effectiveResolutions({student_id:{$in:studentIds},target_date:{$gte:`${year}-${String(month).padStart(2,"0")}-01`,$lte:`${year}-${String(month).padStart(2,"0")}-31`}});
   const attendanceByStudent = new Map<string, any[]>();
-  for (const r of attendanceRecords) {
+  for (const r of mergeAttendanceResolutions(attendanceRecords,centerResolutions)) {
     const key = String(r.student_id);
     if (!attendanceByStudent.has(key)) attendanceByStudent.set(key, []);
     attendanceByStudent.get(key)!.push(r);
@@ -140,8 +141,8 @@ export const getPublicCenterStudentReport = async (req: Request, res: Response):
     const teacher = teacherMap.get(String(s.teacher_id));
     const group = s.group_id ? groupMap.get(String(s.group_id)) : null;
     const records = attendanceByStudent.get(sid) ?? [];
-    const presentCount = records.filter((r: any) => r.status === "present").length;
-    const absentCount = records.filter((r: any) => r.status === "absent").length;
+    const presentCount = records.filter((r: any) => r.status === "present" && !["guest","substitute"].includes(r.attendance_kind)).length;
+    const absentCount = records.filter((r: any) => r.status === "absent" && !r.resolution).length;
     const sub = subByStudent.get(sid);
     const isPaid = sub?.status === "paid" || sub?.status === "exempt";
     return {

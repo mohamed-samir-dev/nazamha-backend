@@ -8,9 +8,11 @@ import { MonthlySubscription } from "../models/MonthlySubscription";
 import { ExamGrade } from "../models/Exam";
 import { BookSale } from "../models/BookSale";
 import { StudentMembership } from "../models/StudentMembership";
+import {AttendanceSubstitution} from "../models/AttendanceSubstitution";
 import { SystemSettings } from "../models/SystemSettings";
 const chain = (data: unknown): any => ({ select() { return this; }, sort() { return this; }, populate() { return this; }, lean() { return this; }, then(resolve: any, reject: any) { return Promise.resolve(data).then(resolve, reject); } });
 const response = (): any => ({ statusCode: 200, status(code: number) { this.statusCode = code; return this; }, json: jest.fn() });
+beforeEach(()=>{jest.spyOn(AttendanceSubstitution,"find").mockReturnValue(chain([]));});
 afterEach(() => jest.restoreAllMocks());
 test("monthly report retains previous-group attendance, separates period scores and excludes exempt cash", async () => {
   jest.spyOn(Student, "findById").mockReturnValue(chain({ _id: "student", teacher_id: "teacher", name: "Test Student", group_id: "group", grade_id: "grade" }));

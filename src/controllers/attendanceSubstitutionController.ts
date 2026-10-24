@@ -1,5 +1,6 @@
 import {Response} from "express";
 import {AuthRequest,canAccessTeacher,teacherFilter} from "../middleware/auth";
+import {Group} from "../models/Group";
 import {AttendanceSubstitution} from "../models/AttendanceSubstitution";
 import {crossGroupEligibility,reverseSubstitution,AttendanceConflict,validAttendanceId} from "../services/crossGroupAttendance";
 
@@ -19,7 +20,9 @@ export const substitutionHistory=async(req:AuthRequest,res:Response)=>{
  const filter:any={...teacherFilter(req)};
  if(req.query.student_id){if(!validAttendanceId(req.query.student_id)){res.status(400).json({message:"معرّف الطالب غير صالح"});return;}filter.student_id=req.query.student_id;}
  const [rows,total]=await Promise.all([AttendanceSubstitution.find(filter).sort({created_at:-1,_id:-1}).skip((page-1)*limit).limit(limit).lean(),AttendanceSubstitution.countDocuments(filter)]);
- res.json({data:rows.map(r=>({...r,id:String(r._id)})),total,page,limit});
+ const groups=rows.length?await Group.find({_id:{$in:rows.flatMap(r=>[r.actual_group_id,r.target_group_id])},...teacherFilter(req)}).select("name").lean():[];
+ const names=new Map(groups.map(g=>[String(g._id),g.name]));
+ res.json({data:rows.map(r=>({...r,id:String(r._id),actual_group_name:names.get(String(r.actual_group_id))||"مجموعة سابقة",target_group_name:names.get(String(r.target_group_id))||"مجموعة سابقة"})),total,page,limit});
 };
 export const revokeSubstitution=async(req:AuthRequest,res:Response)=>{
  if(!validAttendanceId(req.params.id)){res.status(400).json({message:"معرّف التعويض غير صالح"});return;}

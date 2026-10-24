@@ -6,7 +6,8 @@ import { Group } from "../models/Group";
 import { Grade } from "../models/Grade";
 import { AttendanceRecord } from "../models/AttendanceRecord";
 import { prepareAttendance } from "../utils/prepareAttendance";
-import { validateCrossGroupAttendance } from "../utils/attendanceScheduleValidator";
+import { resolveLesson } from "../services/crossGroupAttendance";
+import {AttendanceSubstitution} from "../models/AttendanceSubstitution";
 import { getStudentAttendanceSummary, upsertAttendance } from "../controllers/attendanceController";
 import { updateStudent } from "../controllers/students.crud.controller";
 import { setFamilyDiscount } from "../controllers/students.discount.controller";
@@ -14,6 +15,7 @@ const T="111111111111111111111111", S="222222222222222222222222", G="33333333333
 const chain=(v:unknown):any=>({lean(){return this;},select(){return this;},then(resolve:any,reject:any){return Promise.resolve(v).then(resolve,reject);}});
 const req=(extra:any={}):AuthRequest=>({user:{id:T,user_type:"teacher",is_admin:false},params:{studentId:S,id:S},body:{},query:{},...extra} as AuthRequest);
 const res=():any=>({statusCode:200,status(n:number){this.statusCode=n;return this;},json:jest.fn()});
+beforeEach(()=>{jest.spyOn(AttendanceSubstitution,"find").mockReturnValue(chain([]));});
 afterEach(()=>{jest.restoreAllMocks();jest.useRealTimers();});
 test("historical attendance remains in summary after transfer",async()=>{
  jest.spyOn(Student,"findOne").mockReturnValue(chain({_id:S,group_join_date:"2026-10-12"}));
@@ -24,17 +26,16 @@ test("attendance before current membership rejected",async()=>{
  jest.spyOn(Group,"findOne").mockReturnValue(chain({_id:G,start_date:"2025-01-01"}));
  await expect(prepareAttendance(T,{_id:S,group_id:G,group_join_date:"2026-10-12"},{session_date:"2026-10-11",status:"present"})).rejects.toThrow("انضمام");
 });
-test("same-day record in previous group cannot be overwritten",async()=>{
+test("same-lesson race returns conflict instead of overwriting another record",async()=>{
+ jest.spyOn(Student,"updateOne").mockReturnValue(chain({matchedCount:1}));jest.spyOn(Group,"updateOne").mockReturnValue(chain({matchedCount:1}));
  jest.spyOn(Student,"findOne").mockReturnValue(chain({_id:S,group_id:G,group_join_date:"2025-01-01"}));
  jest.spyOn(Group,"findOne").mockReturnValue(chain({_id:G}));
  const write=jest.spyOn(AttendanceRecord,"findOneAndUpdate").mockRejectedValue({code:11000});
  const r=res();await upsertAttendance(req({body:{student_id:S,session_date:"2025-01-02",status:"present"}}),r);
  expect(r.statusCode).toBe(409);expect(write.mock.calls[0][0]).toMatchObject({teacher_id:T,group_id:G,student_id:S,session_date:"2025-01-02"});
 });
-test("requested-week Sunday retains correct calendar date in Cairo",async()=>{
- jest.useFakeTimers().setSystemTime(new Date("2026-10-11T22:00:00Z"));
- const result=await validateCrossGroupAttendance({id:G,name:"الأحد",day_of_week:"الأحد"},S,"2026-10-12");
- expect(result.nextScheduledDate).toBe("2026-10-11");expect(result.reason).toContain("2026-10-11");expect(result.decision).toBe("confirm");
+test("resolving a lesson never silently substitutes another calendar date",()=>{
+ expect(resolveLesson({_id:G,name:"الأحد",day_of_week:"الأحد",time:"17:00"},"2026-10-12",[])).toBeNull();
 });
 test.each([false,true])("grade mismatch cannot be bypassed by changing grade with group (%s)",async(changeGrade)=>{
  jest.spyOn(Student,"findOne").mockReturnValue(chain({_id:S,teacher_id:T,grade_id:Y,group_id:S}));

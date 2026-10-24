@@ -74,7 +74,7 @@ app.use("/api/auth/staff-login", rateLimit({ store: sharedRateStore("staff-login
 
 
 // Logging & parsing
-morgan.token("url", req => ((req as express.Request).originalUrl || req.url || "").replace(/([?&](?:token|card)=)[^&]*/gi, "$1[redacted]"));
+morgan.token("url", req => ((req as express.Request).originalUrl || req.url || "").replace(/([?&](?:token|card|qr|qr_text)=)[^&]*/gi, "$1[redacted]"));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 app.use((req, res, next) => {
   if (req.headers["content-type"]?.startsWith("multipart/")) return next();

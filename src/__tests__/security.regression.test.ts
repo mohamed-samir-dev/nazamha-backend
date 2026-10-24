@@ -1,3 +1,4 @@
+jest.mock("../services/attendanceResolutions",()=>({effectiveResolutions:jest.fn().mockResolvedValue([]),mergeAttendanceResolutions:(rows:unknown)=>rows}));
 jest.mock("../services/counters", () => ({ nextSequence: jest.fn().mockResolvedValue(1) }));
 jest.mock("../services/atomicController", () => ({ atomicController: (handler: unknown) => handler, series: (queries: PromiseLike<unknown>[]) => Promise.all(queries) }));
 import { CenterStudent } from "../models/CenterStudent";

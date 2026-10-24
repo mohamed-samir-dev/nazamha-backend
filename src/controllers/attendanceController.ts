@@ -231,13 +231,16 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
     if (ops.length > 0) await mongoose.connection.transaction(async session => {
       const owner=resolvedTeacherId || req.user!.id;
       const freshStudents=await Student.find({_id:{$in:studentIds},teacher_id:owner}).session(session).lean();
-      for(const fresh of freshStudents) await Student.updateOne({_id:fresh._id,teacher_id:owner},{$inc:{mutation_version:1}},{session});
-      for(const gid of [...new Set(prepared.map(r=>String(r.group_id)))].sort()) await Group.updateOne({_id:gid,teacher_id:owner},{$inc:{__v:1}},{session});
+      await Student.updateMany({_id:{$in:freshStudents.map(s=>s._id)},teacher_id:owner},{$inc:{mutation_version:1}},{session});
+      const groupIds=[...new Set([...freshStudents.map(s=>String(s.group_id)),...prepared.map(r=>String(r.group_id))])];
+      const currentGroups=await Group.find({_id:{$in:groupIds},teacher_id:owner}).session(session).lean();
+      const currentGroupMap=new Map(currentGroups.map(g=>[String(g._id),g]));
+      await Group.updateMany({_id:{$in:groupIds},teacher_id:owner},{$inc:{__v:1}},{session});
       for(const r of allowedRecords){
         const fresh=freshStudents.find(s=>String(s._id)===r.student_id);
         if(!fresh || (fresh.is_suspended&&(!fresh.suspended_until||new Date(fresh.suspended_until)>=new Date())))throw new Error("تغيرت أهلية الطالب؛ أعد تحميل الحصة");
         await verifyAttendanceQR(owner,fresh,r.qr_text);
-        const rechecked=await prepareAttendance(owner,fresh,r);
+        const rechecked=await prepareAttendance(owner,fresh,r,currentGroupMap);
         const old=prepared.find(p=>p.student_id===r.student_id&&p.session_date===r.session_date);
         if(!old || String(old.group_id)!==String(rechecked.group_id))throw new Error("تغيرت مجموعة الطالب؛ أعد تحميل الحصة");
       }
@@ -276,7 +279,7 @@ export const getStudentAttendanceSummary = async (req: AuthRequest, res: Respons
   for (const r of resolved) {
     if(cancelled.get(String(r.group_id))?.has(r.session_date))continue;
     const key = `${r.year}-${r.month}`;
-    const cur = map.get(key) ?? { present: 0, absent: 0, month: r.month, year: r.year };
+    const cur:NonNullable<ReturnType<typeof map.get>> = map.get(key) ?? { present: 0, absent: 0, month: r.month, year: r.year };
     if(r.resolution)cur[r.resolution==="compensated"?"compensated":"exempt"]=(cur[r.resolution==="compensated"?"compensated":"exempt"]||0)+1;
     else if(r.attendance_kind==="guest"||r.attendance_kind==="substitute")cur.guest=(cur.guest||0)+1;
     else if (r.status === "present") cur.present++; else cur.absent++;
@@ -382,7 +385,7 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
 export const deleteAttendance = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const record=await AttendanceRecord.findOne({_id:req.params.id,...teacherFilter(req)}).lean();
   if(!record){res.status(404).json({message:"سجل الحضور غير موجود"});return;}
-  await invalidateSubstitutions({teacher_id:record.teacher_id,attendance_id:record._id},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"تم إلغاء الحضور الفعلي؛ التعويض أو الإعفاء يحتاج مراجعة");
+  await invalidateSubstitutions({teacher_id:record.teacher_id,student_id:record.student_id,$or:[{attendance_id:record._id},{target_group_id:record.group_id,target_date:record.session_date}]},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"تم إلغاء الحضور الفعلي؛ التعويض أو الإعفاء يحتاج مراجعة");
   await AttendanceRecord.findOneAndDelete({_id:record._id,...teacherFilter(req)});
   res.json({message:"تم إلغاء الحضور؛ حُفظ تاريخ التعويض للمراجعة"});
 });

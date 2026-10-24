@@ -46,7 +46,7 @@ export function resolveLesson(group:any,date:string,snapshots:any[]){
  return {date,time:saved?.time || group.time,session_id:saved? id(saved._id):undefined};
 }
 
-async function loadContext(teacherId:string,input:CrossGroupInput,session?:ClientSession){
+async function loadContext(teacherId:string,input:CrossGroupInput,session?:ClientSession,allowClosed=false){
  if(!validAttendanceId(teacherId)||!validAttendanceId(input.student_id)||!validAttendanceId(input.scanner_group_id)||!validAttendanceDate(input.requested_date))fail("معرّف الطالب أو المجموعة أو تاريخ الحصة غير صالح",400);
  const student=await read(Student.findOne({_id:input.student_id,teacher_id:teacherId}),session);
  if(!student)fail("الطالب غير متاح في حساب المدرس",403);
@@ -75,14 +75,17 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
  if(!actual)fail("الحصة الحالية ملغاة أو غير موجودة في الجدول",400);
  const now=new Date(),starts=buildLocalDate(actual.date,actual.time);
  // Match the existing attendance window: five minutes before, one hour after.
- if(input.requested_date!==today||now.getTime()<starts.getTime()-5*60000||now.getTime()>=starts.getTime()+3600000)fail("الحصة ليست مفتوحة الآن للحضور خارج المجموعة",400);
+ const actualOpen=input.requested_date===today&&now.getTime()>=starts.getTime()-5*60000&&now.getTime()<starts.getTime()+3600000;
+ if(!actualOpen&&!allowClosed)fail("الحصة ليست مفتوحة الآن للحضور خارج المجموعة",400);
  const joined=student.group_join_date || student.created_at?.toISOString().slice(0,10);
  if(joined&&input.requested_date<joined)fail("لا يمكن تسجيل الحضور قبل انضمام الطالب",400);
  const enrolled=(date:string)=>{
    const membership=memberships.find((m:any)=>m.starts_on<=date&&(!m.ends_on||m.ends_on>=date));
-   if(membership)return id(membership.group_id)===id(original._id);
+   if(membership)return id(membership.group_id)===id(original._id)&&(!membership.grade_id||id(membership.grade_id)===id(original.grade_id));
+   if(memberships.length)return false;
    return (!joined||date>=joined)&&id(student.group_id)===id(original._id);
  };
+ if(!enrolled(input.requested_date))fail("الطالب غير مسجل في مجموعته الأصلية بتاريخ الحصة",403);
  const previous:LessonOption[]=[],future:LessonOption[]=[];
  for(const cursor=new Date(from+"T12:00:00Z");cursor.toISOString().slice(0,10)<=to;cursor.setUTCDate(cursor.getUTCDate()+1)){
    const date=cursor.toISOString().slice(0,10),lesson=resolveLesson(original,date,snapshots);
@@ -96,14 +99,14 @@ async function loadContext(teacherId:string,input:CrossGroupInput,session?:Clien
    if(start.getTime()+3600000<=now.getTime()&&record?.status==="absent")previous.push(option);
    else if(start>now)future.push(option);
  }
- const existing=records.find((r:any)=>id(r.group_id)===id(destination._id)&&r.session_date===input.requested_date&&r.status==="present");
- return {student,teacher,original,destination,actual,previous:previous.reverse(),future,existing,substitutions};
+ const existing=records.find((r:any)=>((id(r.group_id)===id(destination._id)&&r.session_date===input.requested_date)||(id(r.scanner_group_id)===id(destination._id)&&r.scanner_session_date===input.requested_date))&&r.status==="present");
+ return {student,teacher,original,destination,actual,actualOpen,previous:previous.reverse(),future,existing,substitutions};
 }
 
 export async function crossGroupEligibility(teacherId:string,input:CrossGroupInput){
- const c=await loadContext(teacherId,input);
+ const c=await loadContext(teacherId,input,undefined,true);
  await verifyAttendanceQR(teacherId,c.student,input.qr_text);
- return {decision:"confirm" as const,reason:"اختر حضورًا كضيف فقط، أو تعويض غياب سابق، أو إعفاء حصة قادمة. لا يتغير انضمام الطالب لمجموعته.",studentGroupId:id(c.original._id),studentGroupName:c.original.name,studentGroupSchedule:c.original.day_of_week,destinationGroupName:c.destination.name,actualLesson:{date:c.actual.date,time:c.actual.time,group_id:id(c.destination._id)},alreadyPresent:!!c.existing,previous:c.previous,future:c.future,previousUnavailable:"لا يوجد غياب سابق مؤهل خلال آخر 90 يومًا في الشهور الدراسية المفعلة.",futureUnavailable:"لا توجد حصة قادمة مؤهلة خلال 8 أسابيع في الشهور الدراسية المفعلة.",nextScheduledDate:null,scheduledDateIsToday:false,scheduledDateIsFuture:false,scheduledDateInCurrentWeek:false,scheduledDateInNextWeek:false};
+ return {decision:"confirm" as const,reason:"اختر حضورًا كضيف فقط، أو تعويض غياب سابق، أو إعفاء حصة قادمة. لا يتغير انضمام الطالب لمجموعته.",studentGroupId:id(c.original._id),studentGroupName:c.original.name,studentGroupSchedule:c.original.day_of_week,destinationGroupName:c.destination.name,actualLesson:{date:c.actual.date,time:c.actual.time,group_id:id(c.destination._id)},alreadyPresent:!!c.existing,canRecord:c.actualOpen,attendanceUnavailable:c.actualOpen?undefined:"الحصة غير مفتوحة الآن. يمكن مراجعة التعويضات والتراجع عنها فقط.",previous:c.previous,future:c.future,previousUnavailable:"لا يوجد غياب سابق مؤهل خلال آخر 90 يومًا في الشهور الدراسية المفعلة.",futureUnavailable:"لا توجد حصة قادمة مؤهلة خلال 8 أسابيع في الشهور الدراسية المفعلة.",nextScheduledDate:null,scheduledDateIsToday:false,scheduledDateIsFuture:false,scheduledDateInCurrentWeek:false,scheduledDateInNextWeek:false};
 }
 
 async function ensureSession(teacherId:string,group:any,date:string,time:string,session:ClientSession){
@@ -132,12 +135,15 @@ export async function commitCrossGroupAttendance(teacherId:string,input:CrossGro
    }
    const option=input.action==="compensate"?c.previous.find(l=>l.date===input.target_date):input.action==="exempt"?c.future.find(l=>l.date===input.target_date):null;
    if(input.action!=="guest"&&!option)fail("الحصة المختارة لم تعد مؤهلة للتعويض أو الإعفاء؛ أعد تحميل الخيارات");
+   const commitTime=Date.now(),actualStarts=buildLocalDate(c.actual.date,c.actual.time).getTime();
+   if(commitTime<actualStarts-5*60000||commitTime>=actualStarts+3600000)fail("انتهت نافذة حضور الحصة أثناء المراجعة؛ أعد التحميل");
+   if(option&&input.action==="exempt"&&buildLocalDate(option.date,option.time).getTime()<=commitTime)fail("بدأت الحصة المختارة ولم تعد مؤهلة للإعفاء");
    const actualSession=await ensureSession(teacherId,c.destination,c.actual.date,c.actual.time,session);
    const record=await AttendanceRecord.findOneAndUpdate({teacher_id:teacherId,student_id:c.student._id,group_id:c.destination._id,session_date:c.actual.date},{$set:{status:"present",attendance_kind:input.action==="guest"?"guest":"substitute",original_group_id:c.original._id,session_id:actualSession._id,scanner_group_id:c.destination._id,scanner_session_date:c.actual.date,month:Number(c.actual.date.slice(5,7)),year:Number(c.actual.date.slice(0,4))},$inc:{attendance_revision:1}},{upsert:true,new:true,runValidators:true,session});
    let substitution:any;
    if(option){
      if(input.action==="compensate") {
-       const locked=await AttendanceRecord.updateOne({teacher_id:teacherId,student_id:c.student._id,group_id:c.original._id,session_date:option.date,status:"absent"},{$inc:{attendance_revision:1}},{session});
+       const locked=await AttendanceRecord.updateOne({teacher_id:teacherId,student_id:c.student._id,group_id:c.original._id,session_date:option.date,status:"absent"},{$inc:{attendance_revision:1}},{session,timestamps:false});
        if(!locked.matchedCount)fail("الغياب السابق تغير ولم يعد مؤهلًا للتعويض");
      }
      const target=await ensureSession(teacherId,c.original,option.date,option.time,session);

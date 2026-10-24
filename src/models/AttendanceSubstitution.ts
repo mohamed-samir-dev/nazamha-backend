@@ -9,9 +9,9 @@ const schema=new Schema({
   actual_date:{type:String,required:true},
   actual_session_id:{type:Schema.Types.ObjectId,ref:"AttendanceSession",required:true},
   attendance_id:{type:Schema.Types.ObjectId,ref:"AttendanceRecord",required:true},
-  target_group_id:{type:Schema.Types.ObjectId},
-  target_date:String,
-  target_session_id:{type:Schema.Types.ObjectId,ref:"AttendanceSession"},
+  target_group_id:{type:Schema.Types.ObjectId,required:true},
+  target_date:{type:String,required:true},
+  target_session_id:{type:Schema.Types.ObjectId,ref:"AttendanceSession",required:true},
   kind:{type:String,enum:["compensate","exempt"],required:true},
   state:{type:String,enum:["approved","revoked","review"],default:"approved"},
   active:{type:Boolean,default:true},
@@ -22,5 +22,6 @@ schema.index({student_id:1,target_group_id:1,target_date:1},{unique:true,partial
 schema.index({attendance_id:1},{unique:true,partialFilterExpression:{active:true}});
 schema.index({teacher_id:1,created_at:-1});
 schema.index({teacher_id:1,student_id:1,target_date:1,active:1});
+schema.index({teacher_id:1,target_date:1,active:1});
 schema.index({teacher_id:1,actual_group_id:1,actual_date:1,active:1});
 export const AttendanceSubstitution=mongoose.model("AttendanceSubstitution",schema);
