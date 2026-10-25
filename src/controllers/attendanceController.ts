@@ -353,7 +353,7 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
   const groupMap=new Map(groups.map(g=>[String(g._id),g]));
   const students = await Student.find({$or:[{group_id:{$in:groupIds}},{_id:{$in:memberships.map(m=>m.student_id)}}], ...base })
     .lean()
-    .select("_id name code group_id group_join_date created_at is_suspended suspended_until") as any[];
+    .select("_id name code parent_phone phone group_id group_join_date created_at is_suspended suspended_until") as any[];
 
   const result: Record<string, { sessionDate: string; absentees: { id: string; name: string; code: string | null }[] }> = {};
   for (const { _id: groupId, lastDate } of lastSessions) {
@@ -375,7 +375,7 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
         if(resolvedTargets.has(`${s._id}|${key}|${lastDate}`))return false;
         return !presentIds.has(String(s._id));
       })
-      .map((s: any) => ({ id: String(s._id), name: s.name, code: s.code ?? null }));
+      .map((s: any) => ({ id: String(s._id), name: s.name, code: s.code ?? null, parent_phone: s.parent_phone || s.phone || null }));
     result[key] = { sessionDate: lastDate, absentees };
   }
 
