@@ -4,6 +4,7 @@ import { createHash } from "crypto";
 import { atomicController, series } from "../services/atomicController";
 import { generateSubscriptionsForStudent, syncAllStudentsForTeacher } from "../services/subscriptionLifecycle";
 export { generateSubscriptionsForStudent, syncNewMonthForAllStudents, syncAllStudentsForTeacher } from "../services/subscriptionLifecycle";
+import { evaluatePaymentScan, resolveGracePeriodDays, getArabicMonthName } from "../utils/paymentGraceUtils";
 import { Response } from "express";
 import { MonthlySubscription, SubscriptionStatus } from "../models/MonthlySubscription";
 import { Student } from "../models/Student";
@@ -516,25 +517,64 @@ export const paySubscriptions = atomicController(async (req: AuthRequest, res: R
   }
   const docs = await MonthlySubscription.find({ _id: { $in: items.map(item => item.id) }, student_id: studentId, teacher_id: student.teacher_id });
   if (docs.length !== items.length) { res.status(404).json({ message: "بعض الاشتراكات لا تخص هذا الطالب" }); return; }
+
+  // 1. التحقق الصريح من الشهور المدفوعة بالفعل لمنع التكرار برسالة واضحة
+  const alreadyPaidDocs = docs.filter(doc => doc.status === "paid");
+  if (alreadyPaidDocs.length > 0) {
+    const paidNames = alreadyPaidDocs.map(doc => getArabicMonthName(doc.month)).join("، ");
+    res.status(409).json({ message: `اشتراك شهر ${paidNames} مدفوع بالفعل، ولا يمكن تسجيل الدفع مرة أخرى.` });
+    return;
+  }
+
+  // 2. التحقق من قواعد الدفع التلقائي وفترة السماح والمتأخرات
+  let autoSuccessMessage: string | null = null;
   if (autoPeriod !== undefined) {
     if (!autoPeriod || !Number.isInteger(autoPeriod.month) || autoPeriod.month < 1 || autoPeriod.month > 12 ||
         !Number.isInteger(autoPeriod.year) || autoPeriod.year < 2000 || autoPeriod.year > 2100) {
       res.status(400).json({ message: "فترة الدفع التلقائي غير صالحة" }); return;
     }
-    const earlier = await MonthlySubscription.exists({student_id: studentId, teacher_id: student.teacher_id, status: "due",
-      $or: [{year: {$lt: autoPeriod.year}}, {year: autoPeriod.year, month: {$lt: autoPeriod.month}}]});
-    if (student.is_suspended || earlier || docs.length !== 1 || docs[0].month !== autoPeriod.month ||
-        docs[0].year !== autoPeriod.year || docs[0].amount - docs[0].discount <= 0) {
-      res.status(409).json({message: "هذه الحالة تحتاج مراجعة وتأكيد يدوي. أعد تحميل مستحقات الطالب."}); return;
+    const earlier = await MonthlySubscription.exists({
+      student_id: studentId,
+      teacher_id: student.teacher_id,
+      status: "due",
+      $or: [{ year: { $lt: autoPeriod.year } }, { year: autoPeriod.year, month: { $lt: autoPeriod.month } }],
+    });
+    if (student.is_suspended || earlier || docs.length !== 1 || docs[0].amount - docs[0].discount <= 0) {
+      res.status(409).json({ message: "هذه الحالة تحتاج مراجعة وتأكيد يدوي. أعد تحميل مستحقات الطالب." }); return;
     }
+    const teacher = Teacher.db?.readyState === 1 ? await Teacher.findById(student.teacher_id).lean() : null;
+    const timezone = (teacher as any)?.settings?.timezone || "Africa/Cairo";
+    const gracePeriodDays = await resolveGracePeriodDays(teacher);
+    const allSubs = await MonthlySubscription.find({ student_id: studentId, teacher_id: student.teacher_id }).sort({ year: 1, month: 1 });
+    const evaluation = evaluatePaymentScan({
+      student,
+      subscriptions: allSubs,
+      targetMonth: autoPeriod.month,
+      targetYear: autoPeriod.year,
+      currentDate: new Date(),
+      timezone,
+      gracePeriodDays,
+    });
+
+    if (!evaluation.eligibleForAuto ||
+        docs[0].month !== evaluation.payPeriod.month || docs[0].year !== evaluation.payPeriod.year) {
+      res.status(409).json({ message: evaluation.message || "هذه الحالة تحتاج مراجعة وتأكيد يدوي. أعد تحميل مستحقات الطالب." }); return;
+    }
+    autoSuccessMessage = evaluation.message;
   }
+
   if (docs.some(doc => {
     const expected = items.find(item => item.id === String(doc._id));
     return doc.status !== "due" || doc.amount !== expected.amount || doc.discount !== expected.discount ||
       !Number.isFinite(doc.amount) || !Number.isFinite(doc.discount) || doc.amount < 0 || doc.discount < 0 || doc.discount > doc.amount;
   })) { res.status(409).json({ message: "تغيرت حالة الشهور أو مبالغها. أعد تحميل بيانات الطالب قبل الدفع." }); return; }
+
   const paidAt = new Date();
-  await MonthlySubscription.updateMany({ _id: { $in: docs.map(doc => doc._id) }, teacher_id: student.teacher_id, status: "due" }, { $set: { status: "paid", paid_at: paidAt, receipt_number: key } });
+  const updateResult = await MonthlySubscription.updateMany({ _id: { $in: docs.map(doc => doc._id) }, teacher_id: student.teacher_id, status: "due" }, { $set: { status: "paid", paid_at: paidAt, receipt_number: key } });
+  if (updateResult.modifiedCount !== docs.length) {
+    res.status(409).json({ message: "تم تسجيل الدفع بالفعل من عملية أخرى أو تم تغيير حالة الاشتراك." }); return;
+  }
+
   const subscriptions = await MonthlySubscription.find({ student_id: studentId, teacher_id: student.teacher_id }).sort({ year: 1, month: 1 });
   // Reuse the owned student and subscriptions already read in this transaction.
   // Most payments need no additional student query or write.
@@ -555,7 +595,13 @@ export const paySubscriptions = atomicController(async (req: AuthRequest, res: R
     amount: docs.reduce((total, doc) => total + doc.amount - doc.discount, 0),
     months: docs.map(doc => ({ month: doc.month, year: doc.year })), created_at: paidAt.toISOString(),
   };
-  const response = { receipt, student: updatedStudent?.toJSON(), subscriptions: subscriptions.map(doc => doc.toJSON()) };
+  const defaultMsg = docs.length === 1 ? `تم تسجيل دفع شهر ${getArabicMonthName(docs[0].month)} بنجاح.` : `تم تسجيل دفع ${docs.length} شهور بنجاح.`;
+  const response = {
+    receipt,
+    student: updatedStudent?.toJSON(),
+    subscriptions: subscriptions.map(doc => doc.toJSON()),
+    message: autoSuccessMessage || defaultMsg,
+  };
   await SubscriptionPayment.create({ teacher_id: student.teacher_id, student_id: studentId, operation_key: key, request_hash: requestHash, ...receipt, response });
   invalidateDashboardCache(String(student.teacher_id));
   res.json(response);
@@ -572,5 +618,27 @@ export const lookupPaymentStudent = async (req: AuthRequest, res: Response): Pro
   const student = await findScannedStudent(teacherFilter(req), { student_code: raw });
   if (!student) { res.status(404).json({ message: "كود الطالب غير موجود أو غير محدد بشكل واضح" }); return; }
   const subscriptions = await MonthlySubscription.find({ student_id: student._id, teacher_id: student.teacher_id }).sort({ year: 1, month: 1 });
-  res.json({ student: { ...student, id: String(student._id) }, subscriptions: subscriptions.map(doc => doc.toJSON()) });
+
+  const teacher = Teacher.db?.readyState === 1 ? await Teacher.findById(student.teacher_id).lean() : null;
+  const timezone = (teacher as any)?.settings?.timezone || "Africa/Cairo";
+  const gracePeriodDays = await resolveGracePeriodDays(teacher);
+
+  const targetMonth = req.query.month ? Number(req.query.month) : undefined;
+  const targetYear = req.query.year ? Number(req.query.year) : undefined;
+
+  const evaluation = evaluatePaymentScan({
+    student,
+    subscriptions,
+    targetMonth,
+    targetYear,
+    currentDate: new Date(),
+    timezone,
+    gracePeriodDays,
+  });
+
+  res.json({
+    student: { ...student, id: String(student._id) },
+    subscriptions: subscriptions.map(doc => doc.toJSON()),
+    evaluation,
+  });
 };

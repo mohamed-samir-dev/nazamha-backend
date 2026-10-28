@@ -11,6 +11,7 @@ export interface ISystemSettings extends Document {
   welcome_message: string;
   welcome_message_enabled: boolean;
   qr_header_type: "image" | "teacher";
+  payment_grace_period_days?: number;
 }
 
 const SystemSettingsSchema = new Schema<ISystemSettings>(
@@ -25,6 +26,7 @@ const SystemSettingsSchema = new Schema<ISystemSettings>(
     welcome_message: { type: String, default: "" },
     welcome_message_enabled: { type: Boolean, default: false },
     qr_header_type: { type: String, enum: ["image", "teacher"], default: "teacher" },
+    payment_grace_period_days: { type: Number, default: 10, min: 0, max: 31 },
   },
   {
     timestamps: true,

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { createExtraSession, deleteExtraSession } from "../controllers/extraSessionController";
 import { getAttendance, validateCrossGroupScan, upsertAttendance, bulkUpsertAttendance, deleteAttendance, autoMarkAbsent, batchAutoMarkAbsent, getStudentAttendanceSummary, getAllTimeStats, getLastSessionAbsentees } from "../controllers/attendanceController";
 import { protect } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
@@ -16,6 +17,8 @@ router.get("/summary/:studentId", asyncHandler(getStudentAttendanceSummary));
 router.post("/validate-cross-group", asyncHandler(eligibility));
 router.get("/substitutions",asyncHandler(substitutionHistory));
 router.post("/substitutions/:id/revoke",asyncHandler(revokeSubstitution));
+router.post("/sessions/extra", asyncHandler(createExtraSession));
+router.delete("/sessions/extra", asyncHandler(deleteExtraSession));
 router.post("/", asyncHandler(upsertAttendance));
 router.post("/bulk", asyncHandler(bulkUpsertAttendance));
 router.post("/auto-absent", asyncHandler(autoMarkAbsent));

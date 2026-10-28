@@ -43,6 +43,7 @@ export interface ISettings {
   timezone: string;
   currency: string;
   allow_online_payment: boolean;
+  payment_grace_period_days?: number;
 }
 
 export interface IStats {
@@ -183,6 +184,7 @@ const SettingsSchema = new Schema<ISettings>(
     timezone: { type: String, default: "Africa/Cairo" },
     currency: { type: String, default: "EGP" },
     allow_online_payment: { type: Boolean, default: false },
+    payment_grace_period_days: { type: Number, min: 0, max: 31 },
   },
   { _id: false }
 );
