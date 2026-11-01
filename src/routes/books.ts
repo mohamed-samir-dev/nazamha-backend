@@ -4,7 +4,7 @@ import { asyncHandler } from "../middleware/asyncHandler";
 import {
   getBooks, getBookById, createBook, updateBook, deleteBook,
   getBookDetails, lookupStudentForSale, sellBook, sellByCode, cancelSale,
-  getStudentBooks, getSales, getBooksReport, markSalePaid, sellExempt, getStudentBookCounts,
+  getStudentBooks, getSales, getBooksReport, markSalePaid, markSaleUnpaid, sellExempt, getStudentBookCounts,
 } from "../controllers/booksController";
 
 const router = Router();
@@ -22,6 +22,7 @@ router.post("/sell-by-code", asyncHandler(sellByCode));
 router.get("/student/:studentId", asyncHandler(getStudentBooks));
 router.patch("/sales/:saleId/cancel", asyncHandler(cancelSale));
 router.patch("/sales/:saleId/mark-paid", asyncHandler(markSalePaid));
+router.patch("/sales/:saleId/mark-unpaid", asyncHandler(markSaleUnpaid));
 router.post("/sell-exempt", asyncHandler(sellExempt));
 
 // Dynamic :id routes last

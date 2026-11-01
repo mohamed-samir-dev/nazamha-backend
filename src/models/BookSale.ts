@@ -11,6 +11,7 @@ export interface IBookSale extends Document {
   discount_reason?: string | null;
   final_price: number;
   is_exempt: boolean;
+  paid?: boolean;
   subscription_id?: mongoose.Types.ObjectId | null;
   month: number;
   year: number;
@@ -32,6 +33,7 @@ const BookSaleSchema = new Schema<IBookSale>(
     discount_reason: { type: String, default: null },
     final_price: { type: Number, required: true },
     is_exempt: { type: Boolean, default: false },
+    paid: { type: Boolean, default: true },
     subscription_id: { type: Schema.Types.ObjectId, ref: "MonthlySubscription", default: null },
     month: { type: Number, required: true },
     year: { type: Number, required: true },

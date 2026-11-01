@@ -109,7 +109,7 @@ export const getBookById = async (req: AuthRequest, res: Response): Promise<void
 
 export const createBook = async (req: AuthRequest, res: Response): Promise<void> => {
   const { name, description, cover_image, grade_id, group_id, price, status, sort_order, code, academic_year } = req.body;
-  if (!name || price == null) { res.status(400).json({ message: "الاسم والسعر مطلوبان" }); return; }
+  if (!name || price == null || isNaN(Number(price)) || Number(price) < 0) { res.status(400).json({ message: "الاسم مطلوب والسعر يجب أن يكون رقماً موجباً" }); return; }
   const teacherId = resolveTeacherId(req);
   if (req.user!.is_admin && !req.user!.is_super_admin && !req.user!.allowed_teacher_ids?.includes(teacherId)) {
     res.status(403).json({ message: "ليس لديك صلاحية لإضافة كتاب لهذا المدرس" }); return;
@@ -136,10 +136,15 @@ export const updateBook = async (req: AuthRequest, res: Response): Promise<void>
   const updates: Record<string, unknown> = {};
   for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
   if (updates.name) updates.name = (updates.name as string).trim();
+  if (updates.price !== undefined) {
+    const p = Number(updates.price);
+    if (isNaN(p) || p < 0) { res.status(400).json({ message: "السعر يجب أن يكون رقماً موجباً" }); return; }
+    updates.price = p;
+  }
   const book = await Book.findOneAndUpdate(
     { _id: req.params.id, ...teacherFilter(req) },
     updates,
-    { new: true }
+    { new: true, runValidators: true }
   );
   if (!book) { res.status(404).json({ message: "الكتاب غير موجود" }); return; }
   const { _id, __v, ...rest } = book.toObject() as any;
@@ -217,7 +222,7 @@ export const getBookDetails = async (req: AuthRequest, res: Response): Promise<v
         code: (s as any).code,
         group_id: String((s as any).group_id),
         purchased: true,
-        paid: !primary.is_exempt,
+        paid: primary.is_exempt ? false : (primary.paid !== false),
         purchase_date: primary.created_at ?? null,
         amount: primary.price ?? null,
         final_price: primary.final_price ?? null,
@@ -233,6 +238,7 @@ export const getBookDetails = async (req: AuthRequest, res: Response): Promise<v
           final_price: es.final_price ?? null,
           discount: es.discount ?? null,
           is_exempt: es.is_exempt ?? false,
+          paid: es.is_exempt ? false : (es.paid !== false),
         })),
       });
     }
@@ -311,7 +317,7 @@ export const sellBook = atomicController(async (req: AuthRequest, res: Response)
   if (req.user!.is_admin && !req.user!.is_super_admin && !req.user!.allowed_teacher_ids?.includes(teacherId)) {
     res.status(403).json({ message: "ليس لديك صلاحية لبيع كتاب لهذا المدرس" }); return;
   }
-  const { book_id, student_id, force_resell } = req.body as { book_id: string; student_id: string; force_resell?: boolean };
+  const { book_id, student_id, force_resell, allow_grade_mismatch } = req.body as { book_id: string; student_id: string; force_resell?: boolean; allow_grade_mismatch?: boolean };
   if (!book_id || !student_id) { res.status(400).json({ message: "book_id و student_id مطلوبان" }); return; }
 
   const [book, student] = await series([
@@ -324,7 +330,7 @@ export const sellBook = atomicController(async (req: AuthRequest, res: Response)
   if ((book as any).status === "unavailable") { res.status(400).json({ message: "الكتاب غير متاح للبيع" }); return; }
 
   const gradeCheck = await checkStudentGradeMatchesBook(student, book);
-  if (!gradeCheck.ok) { res.status(422).json({ message: gradeCheck.message, error_code: "GRADE_MISMATCH" }); return; }
+  if (!gradeCheck.ok && !allow_grade_mismatch) { res.status(422).json({ message: gradeCheck.message, error_code: "GRADE_MISMATCH" }); return; }
 
   await Student.updateOne({ _id: student!._id, ...filter }, { $inc: { mutation_version: 1 } });
   const existingSale = await BookSale.findOne({ ...filter, book_id, student_id, status: "active" }).lean();
@@ -388,11 +394,13 @@ export const sellByCode = atomicController(async (req: AuthRequest, res: Respons
     res.status(403).json({ message: "ليس لديك صلاحية لبيع كتاب لهذا المدرس" }); return;
   }
 
-  const { student_code, student_id: studentIdParam, book_id, force_resell = false } = req.body as {
+  const { student_code, student_id: studentIdParam, book_id, force_resell = false, force_confirm = false, allow_grade_mismatch = false } = req.body as {
     student_code?: string;
     student_id?: string;
     book_id: string;
     force_resell?: boolean;
+    force_confirm?: boolean;
+    allow_grade_mismatch?: boolean;
   };
 
   if ((!student_code && !studentIdParam) || !book_id) {
@@ -425,7 +433,7 @@ export const sellByCode = atomicController(async (req: AuthRequest, res: Respons
 
   // ── 2. Grade eligibility check (may do 1-3 extra DB reads if grades differ) ──
   const gradeCheck = await checkStudentGradeMatchesBook(student, book);
-  if (!gradeCheck.ok) {
+  if (!gradeCheck.ok && !allow_grade_mismatch) {
     res.status(422).json({ message: gradeCheck.message, error_code: "GRADE_MISMATCH" });
     return;
   }
@@ -487,7 +495,7 @@ export const sellByCode = atomicController(async (req: AuthRequest, res: Respons
 
   // Case B: student has a discount or is exempt — show pricing for confirmation
   // unless force_resell is set (meaning the teacher already saw and confirmed)
-  if (!force_resell && (isExempt || discount > 0)) {
+  if (!force_confirm && !force_resell && (isExempt || discount > 0)) {
     res.status(200).json({
       needs_confirmation: true,
       reason: "has_discount",
@@ -533,14 +541,31 @@ export const sellByCode = atomicController(async (req: AuthRequest, res: Respons
 });
 
 export const markSalePaid = async (req: AuthRequest, res: Response): Promise<void> => {
-  const sale = await BookSale.findOne({ _id: req.params.saleId, ...teacherFilter(req), status: "active" }).lean();
+  const sale = await BookSale.findOneAndUpdate(
+    { _id: req.params.saleId, ...teacherFilter(req), status: "active" },
+    { paid: true },
+    { new: true }
+  );
   if (!sale) { res.status(404).json({ message: "عملية البيع غير موجودة" }); return; }
-  res.json({ message: "تم تسجيل الدفع" });
+  res.json({ message: "تم تسجيل الدفع بنجاح", sale });
+};
+
+export const markSaleUnpaid = async (req: AuthRequest, res: Response): Promise<void> => {
+  const sale = await BookSale.findOneAndUpdate(
+    { _id: req.params.saleId, ...teacherFilter(req), status: "active" },
+    { paid: false },
+    { new: true }
+  );
+  if (!sale) { res.status(404).json({ message: "عملية البيع غير موجودة" }); return; }
+  res.json({ message: "تم إلغاء الدفع", sale });
 };
 
 export const sellExempt = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const filter = teacherFilter(req);
   const teacherId = resolveTeacherId(req);
+  if (req.user!.is_admin && !req.user!.is_super_admin && !req.user!.allowed_teacher_ids?.includes(teacherId)) {
+    res.status(403).json({ message: "ليس لديك صلاحية لإعفاء كتاب لهذا المدرس" }); return;
+  }
   const { book_id, student_id } = req.body as { book_id: string; student_id: string };
   if (!book_id || !student_id) { res.status(400).json({ message: "book_id و student_id مطلوبان" }); return; }
 
@@ -574,13 +599,14 @@ export const sellExempt = atomicController(async (req: AuthRequest, res: Respons
 
 export const cancelSale = async (req: AuthRequest, res: Response): Promise<void> => {
   const { cancel_reason } = req.body;
+  const actorId = req.user!.actor_id || req.user!.id;
   const sale = await BookSale.findOneAndUpdate(
     { _id: req.params.saleId, ...teacherFilter(req), status: "active" },
-    { status: "cancelled", cancelled_at: new Date(), cancel_reason: cancel_reason || null },
+    { status: "cancelled", cancelled_at: new Date(), cancelled_by: actorId, cancel_reason: cancel_reason || null },
     { new: true }
   );
   if (!sale) { res.status(404).json({ message: "عملية البيع غير موجودة" }); return; }
-  invalidateDashboardCache(req.user!.id);
+  invalidateDashboardCache(String(sale.teacher_id));
   res.json({ message: "تم إلغاء البيع", sale });
 };
 
@@ -690,10 +716,10 @@ export const getBooksReport = async (req: AuthRequest, res: Response): Promise<v
   if (req.query.year) matchFilter.year = Number(req.query.year);
 
   const [totalBooks, salesAgg, studentsCount, buyerCountAgg] = await Promise.all([
-    Book.countDocuments({ ...filter, status: "available" }),
+    Book.countDocuments(filter),
     BookSale.aggregate([
       { $match: matchFilter },
-      { $group: { _id: "$book_id", sales_count: { $sum: 1 }, revenue: { $sum: "$final_price" }, total_discount: { $sum: "$discount" }, exempt_count: { $sum: { $cond: ["$is_exempt", 1, 0] } } } },
+      { $group: { _id: "$book_id", sales_count: { $sum: 1 }, revenue: { $sum: "$final_price" }, total_discount: { $sum: { $cond: ["$is_exempt", 0, "$discount"] } }, exempt_count: { $sum: { $cond: ["$is_exempt", 1, 0] } } } },
       { $sort: { sales_count: -1 } },
     ]),
     Student.countDocuments(filter),

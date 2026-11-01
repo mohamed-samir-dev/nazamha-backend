@@ -4,6 +4,7 @@ import { Response } from "express";
 import { AuthRequest } from "../middleware/auth";
 import { QuestionBank } from "../models/QuestionBank";
 import { Question } from "../models/Question";
+import { Exam } from "../models/Exam";
 
 const mapBank = (b: any) => ({
   id: b._id.toString(),
@@ -59,7 +60,11 @@ export const updateBank = async (req: AuthRequest, res: Response): Promise<void>
 export const deleteBank = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
   const bank = await QuestionBank.findOne({ _id: req.params.id, teacher_id: req.user!.id });
   if (!bank) { res.status(404).json({ message: "البنك غير موجود" }); return; }
-  await series([bank.deleteOne(), Question.deleteMany({ bank_id: bank._id })]);
+  await series([
+    bank.deleteOne(),
+    Question.deleteMany({ bank_id: bank._id }),
+    Exam.updateMany({ bank_id: bank._id.toString() }, { $set: { bank_id: null } }),
+  ]);
   res.status(204).end();
 });
 
@@ -74,10 +79,11 @@ export const duplicateBank = atomicController(async (req: AuthRequest, res: Resp
     exam_date: bank.exam_date || "",
     grade_id: bank.grade_id || null,
     group_id: bank.group_id || null,
+    total_score: bank.total_score || null,
   });
-  const questions = await Question.find({ bank_id: bank._id }).lean();
+  const questions = await Question.find({ bank_id: bank._id }).sort({ order: 1, created_at: 1 }).lean();
   if (questions.length > 0) {
-    await Question.insertMany(questions.map(q => ({
+    await Question.insertMany(questions.map((q, idx) => ({
       bank_id: newBank._id,
       content: q.content,
       options: q.options,
@@ -89,6 +95,7 @@ export const duplicateBank = atomicController(async (req: AuthRequest, res: Resp
       section_name: q.section_name,
       image_base64: q.image_base64,
       marks: q.marks ?? null,
+      order: q.order ?? idx,
       teacher_notes: q.teacher_notes || null,
       model_answer: q.model_answer || null,
     })));
@@ -96,24 +103,39 @@ export const duplicateBank = atomicController(async (req: AuthRequest, res: Resp
   res.status(201).json(mapBank(newBank.toObject()));
 });
 
+export const normalizeQuestionType = (t?: string | null): "single_choice" | "multiple_choice" | "true_false" | "essay" => {
+  if (t === "essay") return "essay";
+  if (t === "multiple_choice") return "multiple_choice";
+  if (t === "true_false") return "true_false";
+  if (t === "single_choice" || t === "mcq") return "single_choice";
+  return "single_choice";
+};
+
 export const getQuestions = async (req: AuthRequest, res: Response): Promise<void> => {
   const bank = await QuestionBank.findOne({ _id: req.params.bankId, teacher_id: req.user!.id });
   if (!bank) { res.status(404).json({ message: "البنك غير موجود" }); return; }
-  const questions = await Question.find({ bank_id: bank._id }).sort({ created_at: 1 }).lean();
-  res.json(questions.map(q => ({ ...q, id: q._id.toString(), _id: undefined, __v: undefined })));
-};
-
-const normalizeQuestionType = (t?: string | null): "mcq" | "essay" | null => {
-  if (t === "essay") return "essay";
-  if (t === "mcq" || t === "single_choice" || t === "multiple_choice" || t === "true_false") return "mcq";
-  return null;
+  const questions = await Question.find({ bank_id: bank._id }).sort({ order: 1, created_at: 1 }).lean();
+  res.json(questions.map(q => ({
+    ...q,
+    id: q._id.toString(),
+    question_type: normalizeQuestionType(q.question_type),
+    _id: undefined,
+    __v: undefined,
+  })));
 };
 
 export const createQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
   const bank = await QuestionBank.findOne({ _id: req.params.bankId, teacher_id: req.user!.id });
   if (!bank) { res.status(404).json({ message: "البنك غير موجود" }); return; }
-  const { content, options, option_images, correct_answer, correct_answers, question_type, essay_lines, section_name, image_base64, marks, teacher_notes, model_answer } = req.body;
+  const { content, options, option_images, correct_answer, correct_answers, question_type, essay_lines, section_name, image_base64, marks, teacher_notes, model_answer, order } = req.body;
   if (!content?.trim()) { res.status(400).json({ message: "نص السؤال مطلوب" }); return; }
+
+  let questionOrder = typeof order === "number" ? order : undefined;
+  if (questionOrder === undefined) {
+    const lastQuestion = await Question.findOne({ bank_id: bank._id }).sort({ order: -1 }).select("order").lean();
+    questionOrder = (lastQuestion?.order ?? -1) + 1;
+  }
+
   const question = await Question.create({
     bank_id: bank._id,
     content: content.trim(),
@@ -126,10 +148,12 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
     section_name,
     image_base64,
     marks: marks ?? null,
+    order: questionOrder,
     teacher_notes: teacher_notes || null,
     model_answer: model_answer || null,
   });
-  res.status(201).json(question);
+  const obj: any = question.toObject();
+  res.status(201).json({ ...obj, id: obj._id.toString(), question_type: normalizeQuestionType(obj.question_type), _id: undefined, __v: undefined });
 };
 
 export const updateQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -138,11 +162,11 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
   const bank = await QuestionBank.findOne({ _id: question.bank_id, teacher_id: req.user!.id });
   if (!bank) { res.status(403).json({ message: "غير مصرح" }); return; }
   const { question_type } = req.body;
-  const allowed = ["content", "options", "option_images", "correct_answer", "correct_answers", "essay_lines", "section_name", "image_base64", "marks", "teacher_notes", "model_answer"];
+  const allowed = ["content", "options", "option_images", "correct_answer", "correct_answers", "essay_lines", "section_name", "image_base64", "marks", "teacher_notes", "model_answer", "order"];
   const rest = Object.fromEntries(Object.entries(req.body).filter(([key]) => allowed.includes(key)));
   const patch = question_type !== undefined ? { ...rest, question_type: normalizeQuestionType(question_type) } : rest;
   const updated = await Question.findByIdAndUpdate(req.params.id, { $set: patch }, { new: true, runValidators: true }).lean();
-  res.json({ ...updated, id: (updated as any)._id.toString(), _id: undefined, __v: undefined });
+  res.json({ ...updated, id: (updated as any)._id.toString(), question_type: normalizeQuestionType((updated as any).question_type), _id: undefined, __v: undefined });
 };
 
 export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -152,4 +176,55 @@ export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<v
   if (!bank) { res.status(403).json({ message: "غير مصرح" }); return; }
   await Question.deleteOne({ _id: question._id });
   res.status(204).end();
+};
+
+export const reorderQuestions = async (req: AuthRequest, res: Response): Promise<void> => {
+  const bank = await QuestionBank.findOne({ _id: req.params.bankId, teacher_id: req.user!.id });
+  if (!bank) { res.status(404).json({ message: "البنك غير موجود" }); return; }
+  const { questionIds } = req.body;
+  if (!Array.isArray(questionIds) || questionIds.length === 0) {
+    res.status(400).json({ message: "قائمة معرفات الأسئلة غير صالحة" });
+    return;
+  }
+  const ops = questionIds.map((id: string, index: number) => ({
+    updateOne: {
+      filter: { _id: id, bank_id: bank._id },
+      update: { $set: { order: index } },
+    },
+  }));
+  await Question.bulkWrite(ops);
+  res.json({ success: true, count: questionIds.length });
+};
+
+export const bulkUpdateMarks = async (req: AuthRequest, res: Response): Promise<void> => {
+  const bank = await QuestionBank.findOne({ _id: req.params.bankId, teacher_id: req.user!.id });
+  if (!bank) { res.status(404).json({ message: "البنك غير موجود" }); return; }
+  const { marks } = req.body;
+  if (!Array.isArray(marks) || marks.length === 0) {
+    res.status(400).json({ message: "بيانات الدرجات غير صالحة" });
+    return;
+  }
+  for (const item of marks) {
+    if (!item.id || typeof item.marks !== "number" || item.marks <= 0) {
+      res.status(400).json({ message: "درجة السؤال يجب أن تكون رقماً موجباً" });
+      return;
+    }
+  }
+  const ops = marks.map((item: { id: string; marks: number }) => ({
+    updateOne: {
+      filter: { _id: item.id, bank_id: bank._id },
+      update: { $set: { marks: item.marks } },
+    },
+  }));
+  await Question.bulkWrite(ops);
+  res.json({ success: true, count: marks.length });
+};
+
+export const uploadQuestionImage = async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!req.file) {
+    res.status(400).json({ message: "لم يتم إرفاق أي صورة" });
+    return;
+  }
+  const url = `/uploads/exams/${req.file.filename}`;
+  res.status(201).json({ url });
 };

@@ -9,6 +9,7 @@ import morgan from "morgan";
 import rateLimit from "express-rate-limit";
 import cookieParser from "cookie-parser";
 import http from "http";
+import path from "path";
 
 // ── Global process-level safety net ──────────────────────────────────────────
 // Catches any Promise rejection that was not caught by a .catch() or try/catch.
@@ -80,6 +81,7 @@ app.use((req, res, next) => {
   if (req.headers["content-type"]?.startsWith("multipart/")) return next();
   express.json({ limit: "20mb" })(req, res, next);
 });
+app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 app.use(cookieParser());
 app.get("/api/csrf-token", csrfTokenHandler);
 app.use(csrfProtection);

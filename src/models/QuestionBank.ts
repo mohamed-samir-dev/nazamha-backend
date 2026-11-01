@@ -32,4 +32,6 @@ const QuestionBankSchema = new Schema<IQuestionBank>(
   }
 );
 
+QuestionBankSchema.index({ teacher_id: 1, created_at: -1 });
+
 export const QuestionBank = mongoose.model<IQuestionBank>("QuestionBank", QuestionBankSchema);
