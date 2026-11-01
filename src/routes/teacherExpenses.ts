@@ -12,6 +12,13 @@ import { asyncHandler } from "../middleware/asyncHandler";
 
 const router = Router();
 router.use(protect);
+router.use((req: any, res: any, next: any) => {
+  if (req.user?.user_type === "staff" || req.user?.effective_teacher_id) {
+    res.status(403).json({ message: "ليس لديك صلاحية لعرض أو تعديل مصروفات المدرس" });
+    return;
+  }
+  next();
+});
 
 router.get("/", asyncHandler(getTeacherExpenses));
 router.get("/statistics", asyncHandler(getExpenseStatistics));

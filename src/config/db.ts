@@ -11,11 +11,13 @@ export const connectDB = async (): Promise<void> => {
   // backend instance while leaving headroom for Atlas internal connections.
   // waitQueueTimeoutMS: fail fast (5 s) instead of queuing forever when pool is full.
   const isDev = process.env.NODE_ENV !== "production";
+  const maxPoolSize = process.env.MONGO_MAX_POOL_SIZE ? parseInt(process.env.MONGO_MAX_POOL_SIZE, 10) : (isDev ? 25 : 75);
+  const minPoolSize = process.env.MONGO_MIN_POOL_SIZE ? parseInt(process.env.MONGO_MIN_POOL_SIZE, 10) : (isDev ? 5 : 10);
 
   await mongoose.connect(uri, {
-    maxPoolSize: isDev ? 5 : 50,
-    minPoolSize: isDev ? 1 : 5,
-    waitQueueTimeoutMS: 5000,
+    maxPoolSize,
+    minPoolSize,
+    waitQueueTimeoutMS: 15000,
     serverSelectionTimeoutMS: 15000,
     socketTimeoutMS: 45000,
     connectTimeoutMS: 15000,

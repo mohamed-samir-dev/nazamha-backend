@@ -138,6 +138,8 @@ describe("delegation and financial permissions", () => {
     ["/api/groups", "POST", {}, []],
     ["/api/teachers", "PATCH", {}, ["teachers"]],
     ["/api/students", "PATCH", { discount_value: 50 }, ["students"]],
+    ["/api/salaries", "GET", {}, ["payments", "reports"]],
+    ["/api/teacher-expenses", "GET", {}, ["payments", "reports"]],
   ])("staff is denied %s %s", (baseUrl, method, body, permissions) => {
     const response = res(), next = jest.fn();
     enforceResourcePermissions(req({ baseUrl, method, body, user: { ...teacher, staff_permissions: permissions } }), response, next);

@@ -24,6 +24,7 @@ router.use(protect);
 router.get("/", asyncHandler(getAllTeacherSubscriptions));
 router.get("/lookup", asyncHandler(lookupPaymentStudent));
 router.get("/payments/recent", asyncHandler(getRecentPayments));
+router.get("/recent-payments", asyncHandler(getRecentPayments));
 router.post("/student/:studentId/pay", asyncHandler(paySubscriptions));
 router.get("/summary", asyncHandler(getSubscriptionsSummary));
 router.get("/batch", asyncHandler(getBatchSubscriptions));

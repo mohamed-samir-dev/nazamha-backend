@@ -144,8 +144,20 @@ export const exportCalendar = async (req: AuthRequest, res: Response): Promise<v
 
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const groups = await Group.find(teacherFilter(req)).sort({ created_at: -1 });
-    res.json(groups);
+    const filter = teacherFilter(req);
+    const [groups, counts] = await Promise.all([
+      Group.find(filter).sort({ created_at: -1 }),
+      Student.aggregate([
+        { $match: { ...filter, is_suspended: { $ne: true }, group_id: { $ne: null } } },
+        { $group: { _id: "$group_id", count: { $sum: 1 } } },
+      ]),
+    ]);
+    const countMap = new Map<string, number>(counts.map((c: any) => [String(c._id), c.count]));
+    const result = groups.map((g) => ({
+      ...g.toJSON(),
+      student_count: countMap.get(String(g._id)) || 0,
+    }));
+    res.json(result);
   } catch {
     res.status(500).json({ message: "حدث خطأ أثناء جلب المجموعات" });
   }
@@ -153,12 +165,23 @@ export const getGroups = async (req: AuthRequest, res: Response): Promise<void> 
 
 export const getGroupsBySubTeacher = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    // teacherFilter scopes the query to the requesting user's teacher — prevents IDOR (H2 fix)
-    const groups = await Group.find({
+    const filter = {
       sub_teacher_id: req.params.subTeacherId,
       ...teacherFilter(req),
-    }).sort({ created_at: -1 });
-    res.json(groups);
+    };
+    const [groups, counts] = await Promise.all([
+      Group.find(filter).sort({ created_at: -1 }),
+      Student.aggregate([
+        { $match: { ...teacherFilter(req), is_suspended: { $ne: true }, group_id: { $ne: null } } },
+        { $group: { _id: "$group_id", count: { $sum: 1 } } },
+      ]),
+    ]);
+    const countMap = new Map<string, number>(counts.map((c: any) => [String(c._id), c.count]));
+    const result = groups.map((g) => ({
+      ...g.toJSON(),
+      student_count: countMap.get(String(g._id)) || 0,
+    }));
+    res.json(result);
   } catch {
     res.status(500).json({ message: "حدث خطأ أثناء جلب المجموعات" });
   }

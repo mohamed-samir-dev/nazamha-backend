@@ -19,6 +19,18 @@ const resolvedAbsenceStages=[
  {$lookup:{from:AttendanceSubstitution.collection.name,let:{sid:"$student_id",gid:"$group_id",date:"$session_date"},pipeline:[{$match:{$expr:{$and:[{$eq:["$student_id","$$sid"]},{$eq:["$target_group_id","$$gid"]},{$eq:["$target_date","$$date"]},{$eq:["$active",true]},{$eq:["$state","approved"]}]}}}],as:"attendanceResolution"}},
  {$match:{$or:[{status:"present"},{"attendanceResolution.0":{$exists:false}}]}},
 ];
+import { invalidateDashboardCache } from "./dashboardController";
+
+const attCache = new Map<string, { data: unknown; exp: number }>();
+const ATT_CACHE_TTL = 30_000;
+
+export function invalidateAttendanceCache(teacherId?: string) {
+  if (!teacherId) { attCache.clear(); return; }
+  for (const k of attCache.keys()) {
+    if (k.startsWith(`${teacherId}:`) || k.includes(`:${teacherId}`) || k.includes(`:${teacherId}:`)) attCache.delete(k);
+  }
+}
+
 const activeSessionStages = [
   {$lookup:{from:"groups",localField:"group_id",foreignField:"_id",as:"attendanceGroup"}},
   {$match:{$expr:{$not:[{$in:["$session_date",{$ifNull:[{$arrayElemAt:["$attendanceGroup.cancelled_sessions",0]},[]]}]}]}}},
@@ -84,10 +96,17 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
   }
   const filter: Record<string, unknown> = { ...base, month: m, year: y };
   if (req.query.student_id) filter.student_id = req.query.student_id;
+  const cacheKeyStr = `${String(base.teacher_id || "all")}:${m}:${y}:${req.query.student_id || "all"}`;
+  for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
+  const cachedAtt = attCache.get(cacheKeyStr);
+  if (cachedAtt && cachedAtt.exp > Date.now()) {
+    res.json(cachedAtt.data);
+    return;
+  }
   const records = await AttendanceRecord.find(filter).lean();
   const prefix=`${y}-${String(m).padStart(2,"0")}`;
   const resolutions=await effectiveResolutions({...base,target_date:{$gte:`${prefix}-01`,$lte:`${prefix}-31`},...(req.query.student_id?{student_id:req.query.student_id}:{})});
-  res.json(mergeAttendanceResolutions(records.map((r: any) => ({
+  const merged = mergeAttendanceResolutions(records.map((r: any) => ({
     ...r,
     id: String(r._id),
     student_id: String(r.student_id),
@@ -95,7 +114,10 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
     teacher_id: r.teacher_id ? String(r.teacher_id) : undefined,
     _id: undefined,
     __v: undefined,
-  })),resolutions));
+  })),resolutions);
+  if (attCache.size >= 500) attCache.delete(attCache.keys().next().value!);
+  attCache.set(cacheKeyStr, { data: merged, exp: Date.now() + ATT_CACHE_TTL });
+  res.json(merged);
 };
 
 /**
@@ -166,6 +188,8 @@ export const upsertAttendance = async (req: AuthRequest, res: Response): Promise
       const actor={id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type};
       await invalidateSubstitutions({teacher_id:teacherId,student_id:prepared.student_id,target_group_id:prepared.group_id,target_date:prepared.session_date},actor,"تعديل الحضور الفعلي في الحصة الأصلية");
       if(prepared.status!=="present") await invalidateSubstitutions({teacher_id:teacherId,attendance_id:result!._id},actor,"تم تصحيح الحضور الفعلي إلى غياب");
+      invalidateAttendanceCache(String(teacherId));
+      invalidateDashboardCache(String(teacherId));
       transactionRes.status(201).json(result);
     } catch(error:any) {
       if(error?.code===11000){transactionRes.status(409).json({message:"تغير سجل الحضور؛ أعد تحميل الحصة"});return;}throw error;
@@ -253,6 +277,8 @@ export const bulkUpsertAttendance = async (req: AuthRequest, res: Response): Pro
     throw error;
   }
   const data = prepared.length ? await AttendanceRecord.find({ teacher_id: resolvedTeacherId || req.user!.id, $or: prepared.map(r => ({student_id:r.student_id,group_id:r.group_id,session_date:r.session_date})) }) : [];
+  invalidateAttendanceCache(String(resolvedTeacherId || req.user!.id));
+  invalidateDashboardCache(String(resolvedTeacherId || req.user!.id));
   res.status(201).json({ message: "تم الحفظ بنجاح", data, suspended_skipped: suspendedNames });
 };
 
@@ -292,7 +318,15 @@ export const getStudentAttendanceSummary = async (req: AuthRequest, res: Respons
 };
 
 export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<void> => {
-  const matchBase = toAggregationFilter(teacherFilter(req));
+  const base = teacherFilter(req);
+  const statsKey = `stats:${String(base.teacher_id || "all")}`;
+  for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
+  const cachedStats = attCache.get(statsKey);
+  if (cachedStats && cachedStats.exp > Date.now()) {
+    res.json(cachedStats.data);
+    return;
+  }
+  const matchBase = toAggregationFilter(base);
   const pipeline = [
     { $match: matchBase },
     ...activeSessionStages,
@@ -308,12 +342,21 @@ export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<
   const results = await AttendanceRecord.aggregate(pipeline);
   const stats: Record<string, { present: number; absent: number }> = {};
   for (const r of results) stats[String(r._id)] = { present: r.present, absent: r.absent };
+  if (attCache.size >= 500) attCache.delete(attCache.keys().next().value!);
+  attCache.set(statsKey, { data: stats, exp: Date.now() + ATT_CACHE_TTL });
   res.json(stats);
 };
 
 // آخر حصة لكل مجموعة + الغائبون — aggregation واحدة بدل جلب كل السجلات
 export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): Promise<void> => {
   const base = teacherFilter(req);
+  const lastKey = `lastSession:${String(base.teacher_id || "all")}`;
+  for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
+  const cachedLast = attCache.get(lastKey);
+  if (cachedLast && cachedLast.exp > Date.now()) {
+    res.json(cachedLast.data);
+    return;
+  }
   const matchBase = toAggregationFilter(base);
 
   // خطوة 1: آخر session_date لكل group_id
@@ -379,6 +422,8 @@ export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): 
     result[key] = { sessionDate: lastDate, absentees };
   }
 
+  if (attCache.size >= 500) attCache.delete(attCache.keys().next().value!);
+  attCache.set(lastKey, { data: result, exp: Date.now() + ATT_CACHE_TTL });
   res.json(result);
 };
 
@@ -387,6 +432,8 @@ export const deleteAttendance = atomicController(async (req: AuthRequest, res: R
   if(!record){res.status(404).json({message:"سجل الحضور غير موجود"});return;}
   await invalidateSubstitutions({teacher_id:record.teacher_id,student_id:record.student_id,$or:[{attendance_id:record._id},{target_group_id:record.group_id,target_date:record.session_date}]},{id:req.user!.actor_id||req.user!.id,type:req.user!.actor_type||req.user!.user_type},"تم إلغاء الحضور الفعلي؛ التعويض أو الإعفاء يحتاج مراجعة");
   await AttendanceRecord.findOneAndDelete({_id:record._id,...teacherFilter(req)});
+  invalidateAttendanceCache(String(record.teacher_id));
+  invalidateDashboardCache(String(record.teacher_id));
   res.json({message:"تم إلغاء الحضور؛ حُفظ تاريخ التعويض للمراجعة"});
 });
 

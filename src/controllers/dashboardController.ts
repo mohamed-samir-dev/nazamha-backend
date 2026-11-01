@@ -77,7 +77,7 @@ export const getDashboard = async (req: AuthRequest, res: Response): Promise<voi
   if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year) || year < 2000 || year > 2100) { res.status(400).json({ message: "فترة غير صالحة" }); return; }
   for (const [k, v] of dashCache) if (v.exp <= Date.now()) dashCache.delete(k);
   const cached = dashCache.get(key);
-  if (req.query.refresh !== "1" && cached && cached.exp > Date.now()) {
+  if (cached && (req.query.refresh !== "1" || (Date.now() - (cached.exp - CACHE_TTL)) < 2000) && cached.exp > Date.now()) {
     res.json(cached.data);
     return;
   }
@@ -92,14 +92,11 @@ export const getDashboard = async (req: AuthRequest, res: Response): Promise<voi
       { $match: { teacher_id: new Types.ObjectId(teacherId), status: "present" } },
       { $group: { _id: { group_id: "$group_id", session_date: "$session_date" }, presentCount: { $sum: 1 } } },
       { $sort: { "_id.session_date": -1, "_id.group_id": 1 } },
-      { $lookup: { from: "groups", localField: "_id.group_id", foreignField: "_id", as: "group" } },
-      { $match: { "group.teacher_id": new Types.ObjectId(teacherId) } },
-      { $limit: 5 },
-      { $project: { group: 0 } },
+      { $limit: 10 },
     ]),
     BookSale.countDocuments({ teacher_id: teacherId, status: "active" }),
     summaryOnly ? Student.aggregate([{ $match:{teacher_id:new Types.ObjectId(teacherId)} },{$group:{_id:"$group_id",count:{$sum:1}}}]) : Promise.resolve([]),
-    summaryOnly ? MonthlySubscription.aggregate([{$match:{teacher_id:new Types.ObjectId(teacherId),month,year}},{$lookup:{from:"students",localField:"student_id",foreignField:"_id",as:"student"}},{$match:{"student.teacher_id":new Types.ObjectId(teacherId)}},{$group:{_id:"$status",count:{$sum:1}}}]) : Promise.resolve([]),
+    summaryOnly ? MonthlySubscription.aggregate([{$match:{teacher_id:new Types.ObjectId(teacherId),month,year}},{$group:{_id:"$status",count:{$sum:1}}}]) : Promise.resolve([]),
   ]);
 
   const students   = studentsRaw.map((s: any) => ({ ...s, id: s._id.toString(), group_id: s.group_id?.toString() ?? null, grade_id: s.grade_id?.toString() ?? null }));
