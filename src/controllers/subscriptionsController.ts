@@ -75,7 +75,7 @@ export const getAllTeacherSubscriptions = async (req: AuthRequest, res: Response
   const subs = await MonthlySubscription.find(query)
     .sort({ year: 1, month: 1 })
     .lean()
-    .select("student_id teacher_id month year status amount discount paid_at");
+    .select("student_id teacher_id month year status amount discount paid_at receipt_number notes created_at");
   res.json(subs.map(({ _id, __v, student_id, teacher_id, ...rest }: any) => ({
     id: String(_id),
     student_id: String(student_id),

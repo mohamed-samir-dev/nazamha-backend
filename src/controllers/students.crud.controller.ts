@@ -64,7 +64,14 @@ export const getStudents = async (req: AuthRequest, res: Response): Promise<void
 
     // If no pagination params → return all (backward compat for print/export)
     if (!pageParam && !limitParam) {
-      const students = await Student.find(teacherFilter(req))
+      const nonPaginatedFilter: Record<string, unknown> = { ...teacherFilter(req) };
+      if (req.query.group_id) {
+        nonPaginatedFilter.group_id = req.query.group_id === "none" ? null : req.query.group_id;
+      }
+      if (req.query.grade_id && req.query.grade_id !== "all") {
+        nonPaginatedFilter.grade_id = req.query.grade_id;
+      }
+      const students = await Student.find(nonPaginatedFilter)
         .select(fields || LISTING_FIELDS)
         .sort({ code: 1 })
         .lean();
