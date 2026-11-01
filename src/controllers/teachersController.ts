@@ -16,6 +16,10 @@ export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
 };
 
 export const changeMyPassword = async (req: AuthRequest, res: Response): Promise<void> => {
+  if (req.user?.actor_type === "staff" || req.user?.effective_teacher_id) {
+    res.status(403).json({ message: "غير مصرح للمساعد بتغيير كلمة مرور المعلم" });
+    return;
+  }
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) {
     res.status(400).json({ message: "كلمة المرور الحالية والجديدة مطلوبتان" }); return;
@@ -34,6 +38,10 @@ export const changeMyPassword = async (req: AuthRequest, res: Response): Promise
 };
 
 export const updateMe = atomicController(async (req: AuthRequest, res: Response): Promise<void> => {
+  if (req.user?.actor_type === "staff" || req.user?.effective_teacher_id) {
+    res.status(403).json({ message: "غير مصرح للمساعد بتعديل بيانات المعلم" });
+    return;
+  }
   // Strict whitelist — only these fields may be updated by the teacher themselves.
   // ALL subscription, billing, feature, and status fields are intentionally excluded.
   const ALLOWED_SELF_UPDATE_FIELDS: (keyof ITeacher)[] = [

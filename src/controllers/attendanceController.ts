@@ -24,10 +24,20 @@ import { invalidateDashboardCache } from "./dashboardController";
 const attCache = new Map<string, { data: unknown; exp: number }>();
 const ATT_CACHE_TTL = 30_000;
 
+function getTeacherCacheKey(base: Record<string, unknown>): string {
+  const tid = base.teacher_id;
+  if (!tid) return "all";
+  if (typeof tid === "string") return tid;
+  if (typeof tid === "object" && "$in" in (tid as any) && Array.isArray((tid as any).$in)) {
+    return ((tid as any).$in as any[]).map(String).sort().join(",");
+  }
+  return String(tid);
+}
+
 export function invalidateAttendanceCache(teacherId?: string) {
   if (!teacherId) { attCache.clear(); return; }
   for (const k of attCache.keys()) {
-    if (k.startsWith(`${teacherId}:`) || k.includes(`:${teacherId}`) || k.includes(`:${teacherId}:`)) attCache.delete(k);
+    if (k.includes(teacherId)) attCache.delete(k);
   }
 }
 
@@ -96,13 +106,6 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
   }
   const filter: Record<string, unknown> = { ...base, month: m, year: y };
   if (req.query.student_id) filter.student_id = req.query.student_id;
-  const cacheKeyStr = `${String(base.teacher_id || "all")}:${m}:${y}:${req.query.student_id || "all"}`;
-  for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
-  const cachedAtt = attCache.get(cacheKeyStr);
-  if (cachedAtt && cachedAtt.exp > Date.now()) {
-    res.json(cachedAtt.data);
-    return;
-  }
   const records = await AttendanceRecord.find(filter).lean();
   const prefix=`${y}-${String(m).padStart(2,"0")}`;
   const resolutions=await effectiveResolutions({...base,target_date:{$gte:`${prefix}-01`,$lte:`${prefix}-31`},...(req.query.student_id?{student_id:req.query.student_id}:{})});
@@ -115,8 +118,6 @@ export const getAttendance = async (req: AuthRequest, res: Response): Promise<vo
     _id: undefined,
     __v: undefined,
   })),resolutions);
-  if (attCache.size >= 500) attCache.delete(attCache.keys().next().value!);
-  attCache.set(cacheKeyStr, { data: merged, exp: Date.now() + ATT_CACHE_TTL });
   res.json(merged);
 };
 
@@ -319,7 +320,7 @@ export const getStudentAttendanceSummary = async (req: AuthRequest, res: Respons
 
 export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<void> => {
   const base = teacherFilter(req);
-  const statsKey = `stats:${String(base.teacher_id || "all")}`;
+  const statsKey = `stats:${getTeacherCacheKey(base)}`;
   for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
   const cachedStats = attCache.get(statsKey);
   if (cachedStats && cachedStats.exp > Date.now()) {
@@ -350,7 +351,7 @@ export const getAllTimeStats = async (req: AuthRequest, res: Response): Promise<
 // آخر حصة لكل مجموعة + الغائبون — aggregation واحدة بدل جلب كل السجلات
 export const getLastSessionAbsentees = async (req: AuthRequest, res: Response): Promise<void> => {
   const base = teacherFilter(req);
-  const lastKey = `lastSession:${String(base.teacher_id || "all")}`;
+  const lastKey = `lastSession:${getTeacherCacheKey(base)}`;
   for (const [k, v] of attCache) if (v.exp <= Date.now()) attCache.delete(k);
   const cachedLast = attCache.get(lastKey);
   if (cachedLast && cachedLast.exp > Date.now()) {
