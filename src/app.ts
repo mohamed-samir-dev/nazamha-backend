@@ -100,6 +100,7 @@ const corsOptions: cors.CorsOptions = {
     "X-Requested-With",
     "Accept",
     "Origin",
+    "idempotency-key",
   ],
   exposedHeaders: ["x-csrf-token"],
   optionsSuccessStatus: 200,
