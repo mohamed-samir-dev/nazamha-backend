@@ -18,11 +18,20 @@ process.on("unhandledRejection", (reason: unknown) => {
   console.error("[process] unhandledRejection:", reason);
 });
 
+process.on("warning", (warning: any) => {
+  if (warning?.name === "DeprecationWarning" && (warning?.code === "DEP0169" || warning?.message?.includes("url.parse"))) {
+    return;
+  }
+  console.warn(`[${warning.name}] ${warning.message}`);
+});
+
 // Catches synchronous throws that escaped all try/catch blocks.
 // We log, then exit so the process manager can restart cleanly.
 process.on("uncaughtException", (err: Error) => {
   console.error("[process] uncaughtException:", err);
-  process.exit(1);
+  if (!process.env.VERCEL) {
+    process.exit(1);
+  }
 });
 
 import { csrfProtection, csrfTokenHandler } from "./middleware/csrf";
@@ -242,7 +251,9 @@ if (!process.env.VERCEL) {
         process.exit(0);
       } catch (error) {
         console.error("[shutdown] failed", error);
-        process.exit(1);
+        if (!process.env.VERCEL) {
+    process.exit(1);
+  }
       }
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));
