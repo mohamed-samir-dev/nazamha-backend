@@ -93,7 +93,39 @@ const corsOptions: cors.CorsOptions = {
   exposedHeaders: ["x-csrf-token"],
   optionsSuccessStatus: 200,
 };
-app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)), credentials: true }));
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions) as any);
+
+// Serverless DB connection middleware
+let dbConnecting: Promise<void> | null = null;
+const ensureDBConnected = async () => {
+  if (mongoose.connection.readyState === 1) return;
+  if (!dbConnecting) {
+    dbConnecting = connectDB()
+      .then(() => {
+        dbConnecting = null;
+      })
+      .catch((err) => {
+        dbConnecting = null;
+        console.error("Failed to connect to DB:", err);
+        throw err;
+      });
+  }
+  await dbConnecting;
+};
+
+app.use(async (req, res, next) => {
+  if (req.method === "OPTIONS" || req.path === "/" || req.path === "/api/health") return next();
+  try {
+    await ensureDBConnected();
+    next();
+  } catch (err: any) {
+    res.status(503).json({
+      error: "Database connection failed",
+      message: process.env.NODE_ENV === "production" ? "Unable to connect to database" : err.message,
+    });
+  }
+});
 app.use(rateLimit({ store: sharedRateStore("global"), windowMs: 15 * 60 * 1000, max: process.env.NODE_ENV === "production" ? 2000 : 5000, message: "طلبات كثيرة جداً، حاول بعد قليل" }));
 
 // Auth-specific rate limits — applied to exact paths before routes are mounted
