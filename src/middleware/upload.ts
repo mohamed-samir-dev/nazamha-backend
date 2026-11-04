@@ -7,13 +7,8 @@ const UPLOAD_DIR = process.env.VERCEL
   ? path.join("/tmp", "uploads", "exams")
   : path.join(process.cwd(), "uploads", "exams");
 
-try {
-  if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  }
-} catch (err) {
-  console.warn("[upload] Failed to create UPLOAD_DIR at startup:", err);
-}
+// Note: Directory creation is deferred to the storage.destination callback
+// to avoid crashing on Vercel's read-only filesystem during module initialization.
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
@@ -21,10 +16,11 @@ const storage = multer.diskStorage({
       if (!fs.existsSync(UPLOAD_DIR)) {
         fs.mkdirSync(UPLOAD_DIR, { recursive: true });
       }
-    } catch {
-      // fallback
+      cb(null, UPLOAD_DIR);
+    } catch (err) {
+      console.error("[upload] Failed to create upload directory:", err);
+      cb(err as Error, UPLOAD_DIR);
     }
-    cb(null, UPLOAD_DIR);
   },
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase() || ".png";
