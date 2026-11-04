@@ -1,28 +1,35 @@
 import "dotenv/config";
 import mongoose from "mongoose";
 import { Admin } from "./models/Admin";
+import crypto from "crypto";
 
 async function main() {
   await mongoose.connect(process.env.MONGODB_URI!);
 
-  const email = process.env.SUPER_ADMIN_EMAIL;
-  const password = process.env.SUPER_ADMIN_PASSWORD;
-  const name = process.env.SUPER_ADMIN_NAME || "Super Admin";
+  console.log("🗑️  Deleting all existing admins...");
+  const deleteResult = await Admin.deleteMany({});
+  console.log(`✅ Deleted ${deleteResult.deletedCount} admin(s)`);
 
-  if (!email || !password) {
-    console.error("❌ SUPER_ADMIN_EMAIL and SUPER_ADMIN_PASSWORD must be set in .env");
-    process.exit(1);
-  }
+  // Generate random credentials
+  const randomId = crypto.randomBytes(4).toString("hex");
+  const email = `admin_${randomId}@nazamha.app`;
+  const password = crypto.randomBytes(12).toString("base64url"); // URL-safe random password
+  const name = "Super Admin";
 
-  const existing = await Admin.findOne({ email });
-  if (existing) {
-    console.log("✅ Super admin already exists:", email);
-    await mongoose.disconnect();
-    return;
-  }
+  await Admin.create({ 
+    name, 
+    email, 
+    password, 
+    is_super_admin: true, 
+    is_active: true 
+  });
 
-  await Admin.create({ name, email, password, is_super_admin: true, is_active: true });
-  console.log("✅ Super admin created:", email);
+  console.log("\n✅ Super admin created successfully!");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("📧 Email:    ", email);
+  console.log("🔑 Password: ", password);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("\n⚠️  Save these credentials - they won't be shown again!\n");
 
   await mongoose.disconnect();
 }

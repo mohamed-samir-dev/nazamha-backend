@@ -202,7 +202,8 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 // Cron: auto-mark absent for sessions that ended 1 hour ago with no attendance recorded
 
-connectDB()
+if (!process.env.VERCEL) {
+  connectDB()
   .then(() => {
     // Pre-warm Redis connection (fire-and-forget — unavailability is non-fatal)
     connectRedis().catch((err) => console.warn("[startup] Redis pre-warm failed:", err.message));
@@ -225,7 +226,8 @@ connectDB()
           stopAbsent(), stopRecurring(),
           new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
         ]);
-        await disconnectDB();
+        await disif (!process.env.VERCEL) {
+  connectDB();
         process.exit(0);
       } catch (error) {
         console.error("[shutdown] failed", error);
