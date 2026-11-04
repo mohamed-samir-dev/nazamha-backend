@@ -3,13 +3,27 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 
-const UPLOAD_DIR = path.join(process.cwd(), "uploads", "exams");
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const UPLOAD_DIR = process.env.VERCEL
+  ? path.join("/tmp", "uploads", "exams")
+  : path.join(process.cwd(), "uploads", "exams");
+
+try {
+  if (!fs.existsSync(UPLOAD_DIR)) {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  }
+} catch (err) {
+  console.warn("[upload] Failed to create UPLOAD_DIR at startup:", err);
 }
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
+    try {
+      if (!fs.existsSync(UPLOAD_DIR)) {
+        fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+      }
+    } catch {
+      // fallback
+    }
     cb(null, UPLOAD_DIR);
   },
   filename: (_req, file, cb) => {
