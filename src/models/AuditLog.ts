@@ -16,7 +16,11 @@ export type AuditAction =
   | "center.teacher.add" | "center.teacher.remove"
   | "center.staff.create" | "center.staff.update" | "center.staff.deactivate" | "center.staff.transfer"
   | "center.room.create" | "center.room.update" | "center.room.delete" | "center.room.activate" | "center.room.deactivate"
-  | "settings.update";
+  | "settings.update"
+  | "employee.create" | "employee.update" | "employee.status_change"
+  | "payroll.create" | "payroll.update" | "payroll.approve" | "payroll.pay" | "payroll.adjust" | "payroll.cancel"
+  | "expense.create" | "expense.update" | "expense.pay" | "expense.cancel"
+  | "recurring.create" | "recurring.update" | "recurring.pause" | "recurring.resume" | "recurring.stop";
 
 export interface IAuditLog extends Document {
   actor_id?: mongoose.Types.ObjectId;

@@ -14,7 +14,8 @@
     "create:admin": "ts-node-dev --transpile-only src/createAdmin.ts",
     "worker": "node dist/workers/index.js",
     "test:architecture": "ts-node --transpile-only scripts/architecture.integration.ts",
-    "schema:preflight": "ts-node --transpile-only scripts/schema-preflight.ts"
+    "schema:preflight": "ts-node --transpile-only scripts/schema-preflight.ts",
+    "migrate:teacher-codes": "ts-node --transpile-only scripts/migrate-teacher-codes.ts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

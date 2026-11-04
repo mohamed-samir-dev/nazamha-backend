@@ -1,6 +1,7 @@
 import mongoose, { Schema, Document, Types, Query } from "mongoose";
 import bcrypt from "bcryptjs";
 import slugify from "slugify";
+import { generateUniqueTeacherCode, TEACHER_CODE_REGEX } from "../utils/teacherCode";
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,7 @@ export interface IAcademicYear {
 // ─── Main Interface ───────────────────────────────────────────────────────────
 
 export interface ITeacher extends Document {
+  teacherCode: string;
   name: string;
   email: string;
   password: string;
@@ -131,6 +133,7 @@ export interface ITeacher extends Document {
   is_email_verified: boolean;
   email_verification_token?: string;
   failed_login_attempts: number;
+  lock_until?: Date;
   last_login_at?: Date;
   last_login_ip?: string;
   last_seen_at?: Date;
@@ -252,6 +255,14 @@ const AcademicYearSchema = new Schema<IAcademicYear>(
 
 const TeacherSchema = new Schema<ITeacher>(
   {
+    teacherCode: {
+      type: String,
+      required: [true, "Teacher code is required"],
+      unique: true,
+      trim: true,
+      uppercase: true,
+      match: [TEACHER_CODE_REGEX, "Invalid teacher code format (expected NZM-XXXXXX)"],
+    },
     name: { type: String, required: true, trim: true, minlength: 2, maxlength: 100 },
     email: {
       type: String,
@@ -293,6 +304,7 @@ const TeacherSchema = new Schema<ITeacher>(
     is_email_verified: { type: Boolean, default: false },
     email_verification_token: { type: String, select: false },
     failed_login_attempts: { type: Number, default: 0 },
+    lock_until: { type: Date },
     last_login_at: { type: Date },
     last_login_ip: { type: String },
     last_seen_at: { type: Date },
@@ -374,12 +386,18 @@ TeacherSchema.pre("validate", async function (next) {
   if (!this.slug) {
     this.slug = await generateUniqueSlug(this.name, this._id as Types.ObjectId);
   }
+  if (!this.teacherCode) {
+    this.teacherCode = await generateUniqueTeacherCode(this.constructor as any);
+  }
   next();
 });
 
 // ─── Password Hook ────────────────────────────────────────────────────────────
 
 TeacherSchema.pre("save", async function (next) {
+  if (!this.isNew && this.isModified("teacherCode")) {
+    return next(new Error("كود المعلم دائم ولا يمكن تعديله"));
+  }
   if (!this.isModified("password")) return next();
   this.password = await bcrypt.hash(this.password, 12);
   if (!this.isNew) this.session_version = (this.session_version || 0) + 1;

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { Teacher } from "../models/Teacher";
 import { Admin, FinancialPermission } from "../models/Admin";
 import { Center } from "../models/Center";
@@ -14,23 +15,50 @@ export interface AuthRequest extends Request {
     allowed_teacher_ids?: string[]; center_id?: string; center_teacher_ids?: string[];
     staff_permissions?: StaffPermission[]; effective_teacher_id?: string; };
 }
-// Authorization state is deliberately read fresh. A cached role must never outlive
-// suspension, reassignment or a password reset on another server process.
+interface CachedAuthUser {
+  user: AuthRequest["user"];
+  expiresAt: number;
+  actor_id: string;
+}
+
+const authUserCache = new Map<string, CachedAuthUser>();
+const AUTH_CACHE_TTL_MS = 30 * 1000; // 30 seconds cache to prevent database hammering on every request
+
 export const protect = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   const token = req.cookies?.token || req.headers.authorization?.replace(/^Bearer /, "");
   if (!token) { res.status(401).json({ message: "غير مصرح" }); return; }
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET!) as jwt.JwtPayload;
-    if (typeof decoded.id !== "string" || !decoded.iat || await isTokenRevoked(token)) {
+    if (typeof decoded.id !== "string" || !decoded.iat) {
+      res.status(401).json({ message: "تم إلغاء الجلسة" }); return;
+    }
+
+    // 1. Fast in-memory cache check
+    const cached = authUserCache.get(token);
+    if (cached && Date.now() < cached.expiresAt) {
+      req.user = cached.user;
+      return enforceResourcePermissions(req, res, next);
+    }
+
+    // 2. Cache miss: check revocation
+    if (await isTokenRevoked(token)) {
+      authUserCache.delete(token);
       res.status(401).json({ message: "تم إلغاء الجلسة" }); return;
     }
     const type: UserType = decoded.user_type ?? (decoded.is_admin ? "admin" : "teacher");
     const models = { teacher: Teacher, admin: Admin, center: Center, staff: CenterStaff };
     if (!Object.prototype.hasOwnProperty.call(models, type)) { res.sendStatus(401); return; }
     const account: any = await (models[type] as any).findById(decoded.id).lean();
-    if (!account || account.deleted_at || !account.is_active) { res.status(403).json({ message: "الحساب غير متاح" }); return; }
-    if ((decoded.version ?? 0) !== (account.session_version || 0)) { res.status(401).json({ message: "تم إلغاء الجلسة" }); return; }
+    if (!account || account.deleted_at || !account.is_active) {
+      authUserCache.delete(token);
+      res.status(403).json({ message: "الحساب غير متاح" }); return;
+    }
+    if ((decoded.version ?? 0) !== (account.session_version || 0)) {
+      authUserCache.delete(token);
+      res.status(401).json({ message: "تم إلغاء الجلسة" }); return;
+    }
     if (account.password_changed_at && decoded.iat < Math.floor(new Date(account.password_changed_at).getTime() / 1000)) {
+      authUserCache.delete(token);
       res.status(401).json({ message: "تم تغيير كلمة المرور، سجل الدخول مجدداً" }); return;
     }
     const id = String(account._id);
@@ -44,7 +72,10 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
     if (type === "center" || type === "staff" || (type === "teacher" && account.center_id)) {
       const centerId = type === "center" ? id : String(account.center_id);
       const center = type === "center" ? account : await Center.findOne({ _id: centerId, is_active: true, deleted_at: null }).lean();
-      if (!center) { res.status(403).json({ message: "السنتر غير متاح" }); return; }
+      if (!center) {
+        authUserCache.delete(token);
+        res.status(403).json({ message: "السنتر غير متاح" }); return;
+      }
       req.user.center_id = centerId;
       if (type === "center" || type === "staff") {
         const filter: Record<string, unknown> = { center_id: centerId, deleted_at: null, is_active: true };
@@ -55,7 +86,10 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
           req.user.staff_permissions = account.permissions || [];
           if (account.teacher_id) {
             const tid = String(account.teacher_id);
-            if (!req.user.center_teacher_ids.includes(tid)) { res.status(403).json({ message: "المدرس غير متاح" }); return; }
+            if (!req.user.center_teacher_ids.includes(tid)) {
+              authUserCache.delete(token);
+              res.status(403).json({ message: "المدرس غير متاح" }); return;
+            }
             // Keep the effective owner for legacy controllers, but preserve the actor
             // and enforce their delegated permissions independently of this view.
             req.user.id = tid; req.user.user_type = "teacher";
@@ -65,8 +99,17 @@ export const protect = async (req: AuthRequest, res: Response, next: NextFunctio
       }
     }
     if (type === "teacher") req.user.allowed_teacher_ids = [id];
+
+    // Store in cache
+    authUserCache.set(token, {
+      user: req.user,
+      expiresAt: Date.now() + AUTH_CACHE_TTL_MS,
+      actor_id: id,
+    });
+
     enforceResourcePermissions(req, res, next);
   } catch (error) {
+    authUserCache.delete(token);
     if (error instanceof jwt.JsonWebTokenError || error instanceof jwt.TokenExpiredError) {
       res.status(401).json({ message: "توكن غير صالح أو منتهي الصلاحية" });
     } else { next(error); }
@@ -165,6 +208,19 @@ export function teacherFilter(req: AuthRequest): Record<string, unknown> {
   return { teacher_id: { $in: u.allowed_teacher_ids || [] } };
 }
 
+/** تحويل teacher_id filter إلى ObjectId للاستخدام في aggregation $match */
+export function toAggregationFilter(base: Record<string, unknown>): Record<string, unknown> {
+  if (!base.teacher_id) return base;
+  const tid = base.teacher_id;
+  const toOid = (id: string | mongoose.Types.ObjectId) =>
+    id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(String(id));
+  if (typeof tid === "string" || tid instanceof mongoose.Types.ObjectId) return { ...base, teacher_id: toOid(tid as any) };
+  if (tid && typeof tid === "object" && "$in" in (tid as any) && Array.isArray((tid as any).$in)) {
+    return { ...base, teacher_id: { $in: ((tid as any).$in as any[]).map(toOid) } };
+  }
+  return base;
+}
+
 export function getAdminTeacherFilter(req: AuthRequest): { teacher_id: { $in: string[] } } | Record<string, never> {
   if (!req.user?.is_admin) {
     return { teacher_id: { $in: req.user?.center_teacher_ids && req.user.user_type !== "teacher" ? req.user.center_teacher_ids : [req.user!.id] } };
@@ -185,8 +241,17 @@ export async function getVisibleTeacherIds(req: AuthRequest): Promise<string[] |
   return visible.map((t: any) => t._id.toString());
 }
 
-// Compatibility for callers; there is no stale authorization cache to invalidate.
-export function invalidateTokenCache(_id: string): void {}
+export function invalidateTokenCache(id?: string): void {
+  if (!id) {
+    authUserCache.clear();
+    return;
+  }
+  for (const [key, entry] of authUserCache.entries()) {
+    if (entry.actor_id === id || entry.user?.id === id) {
+      authUserCache.delete(key);
+    }
+  }
+}
 export function canAccessTeacher(req: AuthRequest, id: unknown): boolean {
   if (typeof id !== "string") return false;
   const u = req.user!;

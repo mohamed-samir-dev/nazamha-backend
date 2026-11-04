@@ -6,7 +6,7 @@ import crypto from "crypto";
 import { Request, Response } from "express";
 import { Group } from "../models/Group";
 import { Student } from "../models/Student";
-import { AuthRequest, teacherFilter } from "../middleware/auth";
+import { AuthRequest, teacherFilter, toAggregationFilter } from "../middleware/auth";
 
 function signCalendarFeedSig(teacherId: string): string {
   const secret = process.env.JWT_SECRET || "nazamha-calendar-secret";
@@ -145,13 +145,20 @@ export const exportCalendar = async (req: AuthRequest, res: Response): Promise<v
 export const getGroups = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const filter = teacherFilter(req);
-    const [groups, counts] = await Promise.all([
-      Group.find(filter).sort({ created_at: -1 }),
-      Student.aggregate([
-        { $match: { ...filter, is_suspended: { $ne: true }, group_id: { $ne: null } } },
-        { $group: { _id: "$group_id", count: { $sum: 1 } } },
-      ]),
-    ]);
+    const groups = await Group.find(filter).sort({ created_at: -1 });
+    const groupIds = groups.map((g) => g._id);
+    const counts = groupIds.length
+      ? await Student.aggregate([
+          {
+            $match: {
+              ...toAggregationFilter(filter),
+              group_id: { $in: groupIds },
+              is_suspended: { $ne: true },
+            },
+          },
+          { $group: { _id: "$group_id", count: { $sum: 1 } } },
+        ])
+      : [];
     const countMap = new Map<string, number>(counts.map((c: any) => [String(c._id), c.count]));
     const result = groups.map((g) => ({
       ...g.toJSON(),
@@ -169,13 +176,20 @@ export const getGroupsBySubTeacher = async (req: AuthRequest, res: Response): Pr
       sub_teacher_id: req.params.subTeacherId,
       ...teacherFilter(req),
     };
-    const [groups, counts] = await Promise.all([
-      Group.find(filter).sort({ created_at: -1 }),
-      Student.aggregate([
-        { $match: { ...teacherFilter(req), is_suspended: { $ne: true }, group_id: { $ne: null } } },
-        { $group: { _id: "$group_id", count: { $sum: 1 } } },
-      ]),
-    ]);
+    const groups = await Group.find(filter).sort({ created_at: -1 });
+    const groupIds = groups.map((g) => g._id);
+    const counts = groupIds.length
+      ? await Student.aggregate([
+          {
+            $match: {
+              ...toAggregationFilter(teacherFilter(req)),
+              group_id: { $in: groupIds },
+              is_suspended: { $ne: true },
+            },
+          },
+          { $group: { _id: "$group_id", count: { $sum: 1 } } },
+        ])
+      : [];
     const countMap = new Map<string, number>(counts.map((c: any) => [String(c._id), c.count]));
     const result = groups.map((g) => ({
       ...g.toJSON(),

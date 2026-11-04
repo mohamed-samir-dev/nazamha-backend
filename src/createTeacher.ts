@@ -17,10 +17,11 @@ async function main() {
     await existing.save();
     console.log("✅ Teacher updated — password reset & activated:", email);
   } else {
-    await Teacher.create({ name: "Test Teacher", email, password, is_active: true });
+    const created = await Teacher.create({ name: "Test Teacher", email, password, is_active: true });
     console.log("✅ Teacher created:");
     console.log("   Email   :", email);
     console.log("   Password:", password);
+    console.log("   Code    :", created.teacherCode);
   }
 
   await mongoose.disconnect();

@@ -557,7 +557,8 @@ export const paySubscriptions = atomicController(async (req: AuthRequest, res: R
     });
 
     if (!evaluation.eligibleForAuto ||
-        docs[0].month !== evaluation.payPeriod.month || docs[0].year !== evaluation.payPeriod.year) {
+        docs[0].month !== evaluation.payPeriod.month || docs[0].year !== evaluation.payPeriod.year ||
+        docs[0].month !== autoPeriod.month || docs[0].year !== autoPeriod.year) {
       res.status(409).json({ message: evaluation.message || "هذه الحالة تحتاج مراجعة وتأكيد يدوي. أعد تحميل مستحقات الطالب." }); return;
     }
     autoSuccessMessage = evaluation.message;

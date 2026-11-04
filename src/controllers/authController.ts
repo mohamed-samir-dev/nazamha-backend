@@ -12,8 +12,6 @@ const signToken = (id: string, user_type: UserType, extra: Record<string, unknow
   return jwt.sign({ id, user_type, ...extra }, process.env.JWT_SECRET!, { expiresIn });
 };
 
-
-
 const IS_PROD = process.env.NODE_ENV === "production";
 
 const COOKIE_OPTIONS = {
@@ -21,21 +19,102 @@ const COOKIE_OPTIONS = {
   secure: IS_PROD,
   sameSite: (IS_PROD ? "none" : "strict") as "none" | "strict",
   maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  path: "/",
 };
 
 const MAX_FAILED_ATTEMPTS = 5;
+const LOCK_TIME_MS = 15 * 60 * 1000; // 15 minutes lockout
+
+interface LockableAccount {
+  failed_login_attempts?: number;
+  lock_until?: Date;
+  save(options?: any): Promise<any>;
+}
+
+function isAccountLocked(account: LockableAccount): boolean {
+  if (account.lock_until) {
+    if (new Date(account.lock_until).getTime() > Date.now()) {
+      return true;
+    }
+    // Lock has expired; reset counters
+    account.lock_until = undefined;
+    account.failed_login_attempts = 0;
+  }
+  return (account.failed_login_attempts || 0) >= MAX_FAILED_ATTEMPTS;
+}
+
+async function recordFailedAttempt(account: LockableAccount): Promise<boolean> {
+  account.failed_login_attempts = (account.failed_login_attempts || 0) + 1;
+  let justLocked = false;
+  if (account.failed_login_attempts >= MAX_FAILED_ATTEMPTS) {
+    account.lock_until = new Date(Date.now() + LOCK_TIME_MS);
+    justLocked = true;
+  }
+  await account.save({ validateBeforeSave: false });
+  return justLocked;
+}
+
+async function recordSuccessfulLogin(
+  account: LockableAccount & { last_login_at?: Date; last_login_ip?: string },
+  ip?: string
+): Promise<void> {
+  account.last_login_at = new Date();
+  account.last_login_ip = ip;
+  account.failed_login_attempts = 0;
+  account.lock_until = undefined;
+  await account.save({ validateBeforeSave: false });
+}
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const { email, password } = req.body;
   const teacher = await Teacher.findOne({ email }).select("+password");
 
   if (!teacher) {
+    // Check if assistant (CenterStaff with teacher_id) is logging in through the teacher portal
+    const { CenterStaff } = await import("../models/CenterStaff");
+    const staff = await CenterStaff.findOne({ email, deleted_at: null }).select("+password");
+    if (staff && (staff as any).teacher_id) {
+      if (isAccountLocked(staff)) {
+        res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مقفل مؤقتاً لمدة 15 دقيقة." });
+        return;
+      }
+      if (!staff.is_active) {
+        res.status(403).json({ message: "الحساب معطل. تواصل مع مدير السنتر." });
+        return;
+      }
+      if (!(await staff.comparePassword(password))) {
+        const locked = await recordFailedAttempt(staff);
+        res.status(locked ? 403 : 401).json({
+          message: locked
+            ? "تم تجاوز الحد الأقصى لمحاولات الدخول. تم قفل الحساب مؤقتاً لمدة 15 دقيقة."
+            : "البريد أو كلمة المرور غير صحيحة",
+        });
+        return;
+      }
+      await recordSuccessfulLogin(staff, req.ip);
+      const token = signToken(staff._id.toString(), "staff", { version: staff.session_version || 0 });
+      res.cookie("token", token, COOKIE_OPTIONS);
+      res.json({
+        token,
+        teacher: {
+          id: staff._id,
+          name: staff.name,
+          email: staff.email,
+          user_type: "staff",
+          teacher_id: (staff as any).teacher_id,
+          effective_teacher_id: (staff as any).teacher_id,
+          permissions: staff.permissions,
+        },
+      });
+      return;
+    }
+
     res.status(401).json({ message: "البريد أو كلمة المرور غير صحيحة" });
     return;
   }
 
-  if (teacher.failed_login_attempts >= MAX_FAILED_ATTEMPTS) {
-    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. تواصل مع مدير النظام." });
+  if (isAccountLocked(teacher)) {
+    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مقفل مؤقتاً لمدة 15 دقيقة." });
     return;
   }
 
@@ -46,23 +125,34 @@ export const login = async (req: Request, res: Response): Promise<void> => {
   }
 
   if (!(await teacher.comparePassword(password))) {
-    teacher.failed_login_attempts += 1;
-    await teacher.save({ validateBeforeSave: false });
-    res.status(401).json({ message: "البريد أو كلمة المرور غير صحيحة" });
+    const locked = await recordFailedAttempt(teacher);
+    res.status(locked ? 403 : 401).json({
+      message: locked
+        ? "تم تجاوز الحد الأقصى لمحاولات الدخول. تم قفل الحساب مؤقتاً لمدة 15 دقيقة."
+        : "البريد أو كلمة المرور غير صحيحة",
+    });
     return;
   }
 
-  teacher.last_login_at = new Date();
-  teacher.last_login_ip = req.ip;
-  teacher.failed_login_attempts = 0;
-  await teacher.save({ validateBeforeSave: false });
+  await recordSuccessfulLogin(teacher, req.ip);
 
   const token = signToken(teacher._id.toString(), "teacher", { version: teacher.session_version || 0 });
   res.cookie("token", token, COOKIE_OPTIONS);
-  res.json({ token, teacher: { id: teacher._id, name: teacher.name, email: teacher.email, slug: teacher.slug, is_admin: false } });
+  res.json({
+    token,
+    teacher: {
+      id: teacher._id,
+      name: teacher.name,
+      email: teacher.email,
+      slug: teacher.slug,
+      teacherCode: teacher.teacherCode,
+      is_admin: false,
+      user_type: "teacher",
+    },
+  });
 };
 
-// Brute Force Protection: blocks account after MAX_FAILED_ATTEMPTS failed attempts
+// Brute Force Protection: blocks account temporarily after MAX_FAILED_ATTEMPTS failed attempts
 export const adminLogin = async (req: Request, res: Response): Promise<void> => {
   const { email, password } = req.body;
   const admin = await Admin.findOne({ email }).select("+password");
@@ -71,8 +161,8 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
     return;
   }
 
-  if (admin.failed_login_attempts >= MAX_FAILED_ATTEMPTS) {
-    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. تواصل مع مدير النظام." });
+  if (isAccountLocked(admin)) {
+    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مقفل مؤقتاً لمدة 15 دقيقة." });
     return;
   }
 
@@ -83,16 +173,16 @@ export const adminLogin = async (req: Request, res: Response): Promise<void> => 
   }
 
   if (!(await admin.comparePassword(password))) {
-    admin.failed_login_attempts += 1;
-    await admin.save({ validateBeforeSave: false });
-    res.status(401).json({ message: "البريد أو كلمة المرور غير صحيحة" });
+    const locked = await recordFailedAttempt(admin);
+    res.status(locked ? 403 : 401).json({
+      message: locked
+        ? "تم تجاوز الحد الأقصى لمحاولات الدخول. تم قفل الحساب مؤقتاً لمدة 15 دقيقة."
+        : "البريد أو كلمة المرور غير صحيحة",
+    });
     return;
   }
 
-  admin.last_login_at = new Date();
-  admin.last_login_ip = req.ip;
-  admin.failed_login_attempts = 0;
-  await admin.save({ validateBeforeSave: false });
+  await recordSuccessfulLogin(admin, req.ip);
 
   // Audit successful admin login
   import("../models/AuditLog").then(({ AuditLog }) => {
@@ -120,8 +210,8 @@ export const centerLogin = async (req: Request, res: Response): Promise<void> =>
     return;
   }
 
-  if (center.failed_login_attempts >= MAX_FAILED_ATTEMPTS) {
-    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. تواصل مع مدير النظام." });
+  if (isAccountLocked(center)) {
+    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مقفل مؤقتاً لمدة 15 دقيقة." });
     return;
   }
 
@@ -132,16 +222,16 @@ export const centerLogin = async (req: Request, res: Response): Promise<void> =>
   }
 
   if (!(await center.comparePassword(password))) {
-    center.failed_login_attempts += 1;
-    await center.save({ validateBeforeSave: false });
-    res.status(401).json({ message: "البريد أو كلمة المرور غير صحيحة" });
+    const locked = await recordFailedAttempt(center);
+    res.status(locked ? 403 : 401).json({
+      message: locked
+        ? "تم تجاوز الحد الأقصى لمحاولات الدخول. تم قفل الحساب مؤقتاً لمدة 15 دقيقة."
+        : "البريد أو كلمة المرور غير صحيحة",
+    });
     return;
   }
 
-  center.last_login_at = new Date();
-  center.last_login_ip = req.ip;
-  center.failed_login_attempts = 0;
-  await center.save({ validateBeforeSave: false });
+  await recordSuccessfulLogin(center, req.ip);
 
   const token = signToken(center._id.toString(), "center", { version: center.session_version || 0 });
   res.cookie("token", token, COOKIE_OPTIONS);
@@ -158,8 +248,8 @@ export const staffLogin = async (req: Request, res: Response): Promise<void> => 
     return;
   }
 
-  if (staff.failed_login_attempts >= MAX_FAILED_ATTEMPTS) {
-    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. تواصل مع مدير السنتر." });
+  if (isAccountLocked(staff)) {
+    res.status(403).json({ message: "تم تجاوز الحد الأقصى لمحاولات الدخول. الحساب مقفل مؤقتاً لمدة 15 دقيقة." });
     return;
   }
 
@@ -170,16 +260,16 @@ export const staffLogin = async (req: Request, res: Response): Promise<void> => 
   }
 
   if (!(await staff.comparePassword(password))) {
-    staff.failed_login_attempts += 1;
-    await staff.save({ validateBeforeSave: false });
-    res.status(401).json({ message: "البريد أو كلمة المرور غير صحيحة" });
+    const locked = await recordFailedAttempt(staff);
+    res.status(locked ? 403 : 401).json({
+      message: locked
+        ? "تم تجاوز الحد الأقصى لمحاولات الدخول. تم قفل الحساب مؤقتاً لمدة 15 دقيقة."
+        : "البريد أو كلمة المرور غير صحيحة",
+    });
     return;
   }
 
-  staff.last_login_at = new Date();
-  staff.last_login_ip = req.ip;
-  staff.failed_login_attempts = 0;
-  await staff.save({ validateBeforeSave: false });
+  await recordSuccessfulLogin(staff, req.ip);
 
   const token = signToken(staff._id.toString(), "staff", { version: staff.session_version || 0 });
   res.cookie("token", token, COOKIE_OPTIONS);
@@ -197,30 +287,39 @@ export const staffLogin = async (req: Request, res: Response): Promise<void> => 
   });
 };
 
-export const logout = async (req: AuthRequest, res: Response): Promise<void> => {
-  // Extract the raw token so we can blacklist it (C2 fix — token invalidated on logout)
+export const logout = async (req: Request, res: Response): Promise<void> => {
+  // Extract the raw token so we can blacklist it (token invalidated on logout)
   const rawToken =
     req.cookies?.token ||
-    (req.headers.authorization?.replace("Bearer ", "") ?? "");
+    (req.headers.authorization?.replace(/^Bearer /, "") ?? "");
 
   if (rawToken) {
     try {
-      const decoded = jwt.decode(rawToken) as { exp?: number } | null;
+      const decoded = jwt.decode(rawToken) as { exp?: number; id?: string } | null;
       const ttlSecs = decoded?.exp
         ? decoded.exp - Math.floor(Date.now() / 1000)
         : 0;
-      await revokeToken(rawToken, ttlSecs);
+      if (ttlSecs > 0) {
+        await revokeToken(rawToken, ttlSecs);
+      }
+
+      // Also flush the in-memory cache for this user
+      const userId = (req as AuthRequest).user?.id || decoded?.id;
+      if (userId) {
+        const { invalidateTokenCache } = await import("../middleware/auth");
+        invalidateTokenCache(userId);
+      }
     } catch {
       // If blacklisting fails, still proceed with logout — cookie is cleared below
     }
-
-    // Also flush the in-memory cache for this user so the 15-min window doesn't
-    // keep the token alive inside this process
-    const { invalidateTokenCache } = await import("../middleware/auth");
-    invalidateTokenCache(req.user!.id);
   }
 
-  res.clearCookie("token", { httpOnly: true, secure: IS_PROD, sameSite: IS_PROD ? "none" : "strict" });
+  res.clearCookie("token", {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: IS_PROD ? "none" : "strict",
+    path: "/",
+  });
   res.json({ message: "تم تسجيل الخروج" });
 };
 

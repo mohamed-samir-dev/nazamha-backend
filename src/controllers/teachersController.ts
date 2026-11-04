@@ -8,6 +8,7 @@ import { AuthRequest, canAccessTeacher } from "../middleware/auth";
 import { syncNewMonthForAllStudents, syncAllStudentsForTeacher } from "../services/subscriptionLifecycle";
 import { AuditLog } from "../models/AuditLog";
 import { invalidateTokenCache } from "../middleware/auth";
+import { normalizeTeacherCode, isValidTeacherCode } from "../utils/teacherCode";
 
 export const getMe = async (req: AuthRequest, res: Response): Promise<void> => {
   const teacher = await Teacher.findById(req.user!.id);
@@ -79,6 +80,30 @@ export const getAllTeachers = async (req: AuthRequest, res: Response): Promise<v
   const filter: Record<string, unknown> = {};
   if (!req.user!.is_super_admin) { filter.hidden_from_admin = { $ne: true }; filter._id = { $in: req.user!.allowed_teacher_ids || [] }; }
 
+  // Filter by exact Teacher Code if provided
+  if (req.query.code) {
+    const normalizedCode = normalizeTeacherCode(String(req.query.code));
+    filter.teacherCode = normalizedCode;
+  } else if (req.query.search) {
+    const rawSearch = String(req.query.search).trim();
+    if (rawSearch) {
+      const normalizedSearchCode = normalizeTeacherCode(rawSearch);
+      if (isValidTeacherCode(normalizedSearchCode)) {
+        filter.$or = [
+          { teacherCode: normalizedSearchCode },
+          { name: { $regex: rawSearch, $options: "i" } },
+          { email: { $regex: rawSearch, $options: "i" } },
+        ];
+      } else {
+        filter.$or = [
+          { name: { $regex: rawSearch, $options: "i" } },
+          { email: { $regex: rawSearch, $options: "i" } },
+          { teacherCode: { $regex: rawSearch.toUpperCase(), $options: "i" } },
+        ];
+      }
+    }
+  }
+
   // Support optional pagination via ?page=&limit= query params.
   // If neither is provided, return all (backward-compatible for legacy callers).
   const pageParam = req.query.page ? Math.max(1, Number(req.query.page)) : null;
@@ -144,33 +169,67 @@ export const getAdminStats = async (req: AuthRequest, res: Response): Promise<vo
   res.json({ expiringSoon, pendingApproval, recentLogs });
 };
 
+export const searchTeacherByCode = async (req: AuthRequest, res: Response): Promise<void> => {
+  if (!req.user!.is_super_admin) {
+    res.status(403).json({ message: "مسموح للمدير العام فقط" });
+    return;
+  }
+  const rawCode = (req.query.code || req.query.q) as string;
+  if (!rawCode || typeof rawCode !== "string") {
+    res.status(400).json({ message: "كود المعلم مطلوب للبحث" });
+    return;
+  }
+  const normalized = normalizeTeacherCode(rawCode);
+  const teacher = await Teacher.findOne({ teacherCode: normalized }).select(SENSITIVE_FIELDS);
+  if (!teacher) {
+    res.status(404).json({ message: "لم يتم العثور على معلم بهذا الكود" });
+    return;
+  }
+  res.json(teacher);
+};
+
 export const createTeacher = async (req: AuthRequest, res: Response): Promise<void> => {
   const { name, email, password, phone, monthly_price, subscription_price, has_bills_feature, has_attendance_feature, is_center_mode, plan_id, subscription_expires_at } = req.body;
   if (!name || !email || !password) {
     res.status(400).json({ message: "الاسم والبريد وكلمة المرور مطلوبة" }); return;
   }
+  const MAX_CREATE_RETRIES = 5;
   let teacher;
-  try {
-  teacher = await Teacher.create({
-    name: name.trim(),
-    email: email.toLowerCase().trim(),
-    password,
-    phone: phone?.trim() || undefined,
-    monthly_price: Number(monthly_price) || 0,
-    subscription_price: Number(subscription_price) || 0,
-    has_bills_feature: has_bills_feature ?? false,
-    has_attendance_feature: has_attendance_feature ?? true,
-    is_center_mode: is_center_mode ?? false,
-    is_active: true,
-    plan_id: plan_id || null,
-    subscription_started_at: new Date(),
-    subscription_expires_at: subscription_expires_at ? new Date(subscription_expires_at) : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-  });
-  } catch (err: any) {
-    if (err.code === 11000) {
-      res.status(400).json({ message: "البريد الإلكتروني مستخدم بالفعل" }); return;
+  let attempt = 0;
+  while (true) {
+    try {
+      teacher = await Teacher.create({
+        name: name.trim(),
+        email: email.toLowerCase().trim(),
+        password,
+        phone: phone?.trim() || undefined,
+        monthly_price: Number(monthly_price) || 0,
+        subscription_price: Number(subscription_price) || 0,
+        has_bills_feature: has_bills_feature ?? false,
+        has_attendance_feature: has_attendance_feature ?? true,
+        is_center_mode: is_center_mode ?? false,
+        is_active: true,
+        plan_id: plan_id || null,
+        subscription_started_at: new Date(),
+        subscription_expires_at: subscription_expires_at ? new Date(subscription_expires_at) : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+      break;
+    } catch (err: any) {
+      if (err.code === 11000) {
+        const keyPattern = err.keyPattern || {};
+        const isTeacherCode = keyPattern.teacherCode || (err.message && err.message.includes("teacherCode"));
+        if (isTeacherCode) {
+          attempt++;
+          if (attempt >= MAX_CREATE_RETRIES) {
+            res.status(500).json({ message: "فشل توليد كود معلم فريد، يرجى المحاولة مرة أخرى" });
+            return;
+          }
+          continue; // retry creating with newly generated code
+        }
+        res.status(400).json({ message: "البريد الإلكتروني مستخدم بالفعل" }); return;
+      }
+      throw err;
     }
-    throw err;
   }
   await AuditLog.create({
     admin_id: req.user!.id,
@@ -178,7 +237,7 @@ export const createTeacher = async (req: AuthRequest, res: Response): Promise<vo
     action: "teacher.create",
     resource_type: "Teacher",
     resource_id: (teacher._id as any).toString(),
-    new_data: { name, email },
+    new_data: { name, email, teacherCode: teacher.teacherCode },
     ip_address: req.ip,
   });
   res.status(201).json(teacher);

@@ -31,6 +31,7 @@ export interface ICenterStaff extends Document {
   permissions: StaffPermission[];
   is_active: boolean;
   failed_login_attempts: number;
+  lock_until?: Date;
   last_login_at?: Date;
   last_login_ip?: string;
   deleted_at?: Date | null;
@@ -62,6 +63,7 @@ const CenterStaffSchema = new Schema<ICenterStaff>(
     },
     is_active: { type: Boolean, default: true },
     failed_login_attempts: { type: Number, default: 0 },
+    lock_until: { type: Date },
     last_login_at: { type: Date },
     last_login_ip: { type: String },
     deleted_at: { type: Date, default: null },

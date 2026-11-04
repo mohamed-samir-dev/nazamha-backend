@@ -14,6 +14,7 @@ export interface ICenter extends Document {
   governorate?: string;
   is_active: boolean;
   failed_login_attempts: number;
+  lock_until?: Date;
   last_login_at?: Date;
   last_login_ip?: string;
   deleted_at?: Date | null;
@@ -43,6 +44,7 @@ const CenterSchema = new Schema<ICenter>(
     governorate: { type: String, trim: true },
     is_active: { type: Boolean, default: true },
     failed_login_attempts: { type: Number, default: 0 },
+    lock_until: { type: Date },
     last_login_at: { type: Date },
     last_login_ip: { type: String },
     deleted_at: { type: Date, default: null },

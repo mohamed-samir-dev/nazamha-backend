@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { protect, adminOnly, superAdminOnly } from "../middleware/auth";
 import { asyncHandler } from "../middleware/asyncHandler";
-import { getMe, changeMyPassword, updateMe, getAllTeachers, getTeacherCounts, getAdminStats, createTeacher, getTeacherById, toggleTeacherVisibility, updateTeacher, deleteTeacher, updateTeacherBanner } from "../controllers/teachersController";
+import { getMe, changeMyPassword, updateMe, getAllTeachers, getTeacherCounts, getAdminStats, createTeacher, getTeacherById, toggleTeacherVisibility, updateTeacher, deleteTeacher, updateTeacherBanner, searchTeacherByCode } from "../controllers/teachersController";
 
 const router = Router();
 router.use(protect);
@@ -9,6 +9,7 @@ router.use(protect);
 router.get("/me", asyncHandler(getMe));
 router.patch("/me", asyncHandler(updateMe));
 router.patch("/me/password", asyncHandler(changeMyPassword));
+router.get("/search/by-code", superAdminOnly, asyncHandler(searchTeacherByCode));
 router.get("/", adminOnly, asyncHandler(getAllTeachers));
 router.get("/admin-stats", adminOnly, asyncHandler(getAdminStats));
 router.get("/counts", adminOnly, asyncHandler(getTeacherCounts));

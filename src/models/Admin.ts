@@ -30,6 +30,7 @@ export interface IAdmin extends Document {
   is_active: boolean;
   financial_permissions: FinancialPermission[];
   failed_login_attempts: number;
+  lock_until?: Date;
   last_login_at?: Date;
   last_login_ip?: string;
   deleted_at?: Date | null;
@@ -51,6 +52,7 @@ const AdminSchema = new Schema<IAdmin>(
       default: [],
     },
     failed_login_attempts: { type: Number, default: 0 },
+    lock_until: { type: Date },
     last_login_at: { type: Date },
     last_login_ip: { type: String },
     deleted_at: { type: Date, default: null },

@@ -243,26 +243,43 @@ export const createCenterTeacher = async (req: AuthRequest, res: Response): Prom
   }
   if (trimmedSubject && trimmedSubject.length > 100) { res.status(400).json({ message: "اسم المادة طويل جداً" }); return; }
 
+  const MAX_CREATE_RETRIES = 5;
   let teacher;
-  try {
-    teacher = await Teacher.create({
-      name: trimmedName,
-      email: trimmedEmail,
-      password,
-      phone: trimmedPhone || undefined,
-      subject: trimmedSubject || undefined,
-      center_id: centerId,
-      is_active: true,
-      subscription_price: 0,
-      has_bills_feature: false,
-      has_attendance_feature: true,
-      is_center_mode: false,
-      subscription_started_at: new Date(),
-      subscription_expires_at: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-    });
-  } catch (err: any) {
-    if (err.code === 11000) { res.status(400).json({ message: "البريد الإلكتروني مستخدم بالفعل" }); return; }
-    throw err;
+  let attempt = 0;
+  while (true) {
+    try {
+      teacher = await Teacher.create({
+        name: trimmedName,
+        email: trimmedEmail,
+        password,
+        phone: trimmedPhone || undefined,
+        subject: trimmedSubject || undefined,
+        center_id: centerId,
+        is_active: true,
+        subscription_price: 0,
+        has_bills_feature: false,
+        has_attendance_feature: true,
+        is_center_mode: false,
+        subscription_started_at: new Date(),
+        subscription_expires_at: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+      });
+      break;
+    } catch (err: any) {
+      if (err.code === 11000) {
+        const keyPattern = err.keyPattern || {};
+        const isTeacherCode = keyPattern.teacherCode || (err.message && err.message.includes("teacherCode"));
+        if (isTeacherCode) {
+          attempt++;
+          if (attempt >= MAX_CREATE_RETRIES) {
+            res.status(500).json({ message: "فشل توليد كود معلم فريد، يرجى المحاولة مرة أخرى" });
+            return;
+          }
+          continue;
+        }
+        res.status(400).json({ message: "البريد الإلكتروني مستخدم بالفعل" }); return;
+      }
+      throw err;
+    }
   }
 
   // Invalidate center token cache so new teacher appears in center_teacher_ids
@@ -274,6 +291,7 @@ export const createCenterTeacher = async (req: AuthRequest, res: Response): Prom
     email: (teacher as any).email,
     phone: (teacher as any).phone ?? null,
     subject: (teacher as any).subject ?? null,
+    teacherCode: (teacher as any).teacherCode,
     is_active: (teacher as any).is_active,
     center_id: centerId,
     created_at: (teacher as any).created_at,
@@ -320,6 +338,7 @@ export const updateCenterTeacher = async (req: AuthRequest, res: Response): Prom
     email: (teacher as any).email,
     phone: (teacher as any).phone ?? null,
     subject: (teacher as any).subject ?? null,
+    teacherCode: (teacher as any).teacherCode,
     is_active: (teacher as any).is_active,
     center_id: (teacher as any).center_id?.toString() ?? null,
     created_at: (teacher as any).created_at,
