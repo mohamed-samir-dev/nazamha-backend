@@ -226,8 +226,7 @@ if (!process.env.VERCEL) {
           stopAbsent(), stopRecurring(),
           new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())),
         ]);
-        await disif (!process.env.VERCEL) {
-  connectDB();
+        await disconnectDB();
         process.exit(0);
       } catch (error) {
         console.error("[shutdown] failed", error);
@@ -238,5 +237,8 @@ if (!process.env.VERCEL) {
     process.on("SIGINT", () => shutdown("SIGINT"));
   })
   .catch((err) => { console.error("Failed to connect to DB:", err); process.exit(1); });
+} else {
+  ensureDBConnected().catch((err) => console.warn("[vercel] DB warm-up failed:", err.message));
+}
 
 export default app;
