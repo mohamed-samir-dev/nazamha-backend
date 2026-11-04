@@ -65,8 +65,18 @@ app.set("trust proxy", 1);
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
-const rawAllowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
-  .split(",")
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://www.alshariyaa.com",
+  "https://alshariyaa.com",
+  "https://nazamha-frontend.vercel.app",
+  "http://localhost:3000",
+  "http://localhost:5000",
+];
+
+const rawAllowedOrigins = [
+  ...DEFAULT_ALLOWED_ORIGINS,
+  ...(process.env.FRONTEND_URL ? process.env.FRONTEND_URL.split(",") : []),
+]
   .map(o => o.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
@@ -74,6 +84,7 @@ const isOriginAllowed = (origin?: string): boolean => {
   if (!origin) return true;
   const cleanOrigin = origin.trim().replace(/\/+$/, "");
   if (rawAllowedOrigins.includes(cleanOrigin)) return true;
+  if (/^https:\/\/(www\.)?alshariyaa\.com$/.test(cleanOrigin)) return true;
   if (/^https:\/\/nazamha-frontend(-[a-z0-9-]+)?\.vercel\.app$/.test(cleanOrigin)) return true;
   return false;
 };
