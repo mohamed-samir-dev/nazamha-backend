@@ -26,7 +26,9 @@ export function validateEnv(): void {
     for (const key of missing) {
       console.error(`[startup] Missing required environment variable: ${key}`);
     }
-    console.error("[startup] Server startup aborted. Set the missing variables in your .env file.");
-    process.exit(1);
+    console.error("[startup] Server startup aborted. Set the missing variables in your .env file or hosting provider settings.");
+    if (!process.env.VERCEL) {
+      process.exit(1);
+    }
   }
 }
