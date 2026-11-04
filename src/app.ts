@@ -62,8 +62,37 @@ const app = express();
 app.set("trust proxy", 1);
 
 // Security
-app.use(helmet());
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000").split(",").map(o => o.trim());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+}));
+const rawAllowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+  .split(",")
+  .map(o => o.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
+const isOriginAllowed = (origin?: string): boolean => {
+  if (!origin) return true;
+  const cleanOrigin = origin.trim().replace(/\/+$/, "");
+  if (rawAllowedOrigins.includes(cleanOrigin)) return true;
+  if (/^https:\/\/nazamha-frontend(-[a-z0-9-]+)?\.vercel\.app$/.test(cleanOrigin)) return true;
+  return false;
+};
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, cb) => cb(null, isOriginAllowed(origin)),
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-csrf-token",
+    "X-Requested-With",
+    "Accept",
+    "Origin",
+  ],
+  exposedHeaders: ["x-csrf-token"],
+  optionsSuccessStatus: 200,
+};
 app.use(cors({ origin: (origin, cb) => cb(null, !origin || allowedOrigins.includes(origin)), credentials: true }));
 app.use(rateLimit({ store: sharedRateStore("global"), windowMs: 15 * 60 * 1000, max: process.env.NODE_ENV === "production" ? 2000 : 5000, message: "طلبات كثيرة جداً، حاول بعد قليل" }));
 
